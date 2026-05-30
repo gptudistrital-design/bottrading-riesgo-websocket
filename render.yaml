@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: bot-trading-riesgo
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
+    envVars:
+      - key: PAPER_MODE
+        value: "true"
+      - key: SCAN_INTERVAL_SECONDS
+        value: "20"
+      - key: BASE_URL
+        value: "https://fapi.binance.com"
+      - key: WS_URL
+        value: "wss://fstream.binance.com/ws/!ticker@arr"
