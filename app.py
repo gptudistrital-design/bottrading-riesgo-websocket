@@ -41,6 +41,9 @@ LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
 API_KEY = os.getenv("BINANCE_API_KEY", "")
 API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
+MIN_GAIN_TO_SHOW = float(os.getenv("MIN_GAIN_TO_SHOW", "0"))
+SPOT_BASE_URL = os.getenv("SPOT_BASE_URL", "https://api.binance.com")
+INCLUDE_SPOT_WINNERS = os.getenv("INCLUDE_SPOT_WINNERS", "true").lower() == "true"
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "120"))
 LEVERAGE = int(os.getenv("LEVERAGE", "1"))
 
@@ -91,6 +94,7 @@ class BotPosition:
 class BinanceFuturesClient:
     def __init__(self) -> None:
         self.exchange_filters: Dict[str, Dict[str, float]] = {}
+        self.last_warning = ""
 
     async def start(self) -> None:
         await self.load_exchange_info()
@@ -99,9 +103,12 @@ class BinanceFuturesClient:
         return None
 
     async def request(self, method: str, path: str, params: Optional[dict] = None, signed: bool = False) -> Any:
-        return await asyncio.to_thread(self._request_sync, method, path, params, signed)
+        return await asyncio.to_thread(self._request_sync, BASE_URL, method, path, params, signed)
 
-    def _request_sync(self, method: str, path: str, params: Optional[dict] = None, signed: bool = False) -> Any:
+    async def public_request(self, base_url: str, path: str, params: Optional[dict] = None) -> Any:
+        return await asyncio.to_thread(self._request_sync, base_url, "GET", path, params, False)
+
+    def _request_sync(self, base_url: str, method: str, path: str, params: Optional[dict] = None, signed: bool = False) -> Any:
         params = dict(params or {})
         headers = {"User-Agent": "BOTTRADINGRIESGO/1.0"}
         if signed:
@@ -117,7 +124,7 @@ class BinanceFuturesClient:
             headers["X-MBX-APIKEY"] = API_KEY
 
         query = urlencode(params, doseq=True)
-        url = f"{BASE_URL}{path}" + (f"?{query}" if query else "")
+        url = f"{base_url}{path}" + (f"?{query}" if query else "")
         request = urllib.request.Request(url, headers=headers, method=method.upper())
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
@@ -147,21 +154,56 @@ class BinanceFuturesClient:
             filters[symbol_info["symbol"]] = row
         self.exchange_filters = filters
 
-    async def winners_24h(self) -> List[dict]:
-        data = await self.request("GET", "/fapi/v1/ticker/24hr")
+    def _ticker_rows(self, data: list, *, market: str) -> List[dict]:
         winners = []
         for item in data:
             symbol = item.get("symbol", "")
-            if symbol not in self.exchange_filters:
+            if not symbol.endswith(QUOTE_ASSET):
                 continue
             try:
                 change = float(item.get("priceChangePercent", 0.0))
                 last = float(item.get("lastPrice", 0.0))
-                quote_volume = float(item.get("quoteVolume", 0.0))
+                quote_volume = float(item.get("quoteVolume", item.get("volume", 0.0)))
             except (TypeError, ValueError):
                 continue
-            if symbol.endswith(QUOTE_ASSET) and last > 0:
-                winners.append({"symbol": symbol, "change": change, "price": last, "quoteVolume": quote_volume})
+            if change < MIN_GAIN_TO_SHOW or last <= 0:
+                continue
+            is_futures = symbol in self.exchange_filters if self.exchange_filters else market == "futures"
+            winners.append({
+                "symbol": symbol,
+                "change": change,
+                "price": last,
+                "quoteVolume": quote_volume,
+                "market": market,
+                "is_futures": is_futures,
+                "can_short": is_futures and market == "futures",
+            })
+        return winners
+
+    async def winners_24h(self) -> List[dict]:
+        winners: List[dict] = []
+        warnings: List[str] = []
+
+        try:
+            futures_data = await self.request("GET", "/fapi/v1/ticker/24hr")
+            winners.extend(self._ticker_rows(futures_data, market="futures"))
+        except Exception as exc:
+            warnings.append(f"Futures ticker no disponible: {exc}")
+
+        if INCLUDE_SPOT_WINNERS:
+            try:
+                spot_data = await self.public_request(SPOT_BASE_URL, "/api/v3/ticker/24hr")
+                seen_futures = {row["symbol"] for row in winners}
+                for row in self._ticker_rows(spot_data, market="spot"):
+                    if row["symbol"] not in seen_futures:
+                        winners.append(row)
+            except Exception as exc:
+                warnings.append(f"Spot ticker no disponible: {exc}")
+
+        self.last_warning = " | ".join(warnings)
+        if not winners and warnings:
+            raise RuntimeError(self.last_warning)
+
         winners.sort(key=lambda row: row["change"], reverse=True)
         return winners[:MAX_SYMBOLS]
 
@@ -223,6 +265,11 @@ class TradingBot:
         self.running = False
         self.last_scan_at = 0.0
         self.last_error = ""
+        self.last_startup_error = ""
+        self.last_data_warning = ""
+        self.scan_count = 0
+        self.websocket_messages = 0
+        self.exchange_symbols_count = 0
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
 
@@ -243,11 +290,23 @@ class TradingBot:
     def _run_loop(self) -> None:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        self.loop.run_until_complete(self._main())
+        try:
+            self.loop.run_until_complete(self._main())
+        except Exception as exc:
+            self.running = False
+            self.last_error = str(exc)
+            self.log(f"Bot detenido por error no controlado: {exc}")
 
     async def _main(self) -> None:
-        await self.client.start()
-        self.log("Bot iniciado en modo PAPER" if PAPER_MODE or not LIVE_TRADING else "Bot iniciado en modo REAL")
+        self.log("Arrancando bot en modo PAPER" if PAPER_MODE or not LIVE_TRADING else "Arrancando bot en modo REAL")
+        try:
+            await self.client.start()
+            self.exchange_symbols_count = len(self.client.exchange_filters)
+            self.log(f"ExchangeInfo cargado: {self.exchange_symbols_count} contratos futures {QUOTE_ASSET}")
+        except Exception as exc:
+            self.last_startup_error = str(exc)
+            self.last_error = str(exc)
+            self.log(f"No se pudo cargar exchangeInfo ({exc}). Continúo con filtros mínimos para mostrar ganadores.")
         await asyncio.gather(self._price_ws(), self._scanner())
 
     async def _price_ws(self) -> None:
@@ -263,13 +322,14 @@ class TradingBot:
                         with self.lock:
                             for item in payload:
                                 symbol = item.get("s")
-                                if symbol not in self.client.exchange_filters:
+                                if self.client.exchange_filters and symbol not in self.client.exchange_filters:
                                     continue
                                 price = float(item.get("c", 0.0))
                                 change = float(item.get("P", 0.0))
                                 if price > 0:
                                     self.prices[symbol] = price
                                     self.changes[symbol] = change
+                                    self.websocket_messages += 1
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log(f"WebSocket desconectado: {exc}; reconectando")
@@ -279,13 +339,22 @@ class TradingBot:
         while self.running:
             try:
                 winners = await self.client.winners_24h()
+                tradable_winners = [row for row in winners if row.get("can_short", True)]
+                high_gain = [row for row in winners if row["change"] >= ENTRY_LEVELS[0]]
                 with self.lock:
                     self.winners = winners
+                    self.scan_count += 1
                     for row in winners:
                         self.prices[row["symbol"]] = row["price"]
                         self.changes[row["symbol"]] = row["change"]
                     self.last_scan_at = time.time()
-                await self._apply_strategy(winners)
+                if self.client.last_warning and self.client.last_warning != self.last_data_warning:
+                    self.last_data_warning = self.client.last_warning
+                    self.last_error = self.client.last_warning
+                    self.log(f"Advertencia de datos: {self.client.last_warning}")
+                top_text = f"{winners[0]['symbol']} {winners[0]['change']:.2f}% ({winners[0].get('market', 'futures')})" if winners else "sin ganadores"
+                self.log(f"Escaneo #{self.scan_count}: {len(winners)} símbolos mostrados, {len(high_gain)} >= {ENTRY_LEVELS[0]:.0f}%, shorteables={len(tradable_winners)}, top: {top_text}")
+                await self._apply_strategy(tradable_winners)
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log(f"Error en escaneo: {exc}")
@@ -293,6 +362,8 @@ class TradingBot:
 
     async def _apply_strategy(self, winners: List[dict]) -> None:
         for row in winners:
+            if not row.get("can_short", True):
+                continue
             symbol = row["symbol"]
             change = row["change"]
             price = self.prices.get(symbol, row["price"])
@@ -379,6 +450,13 @@ class TradingBot:
                 "last_scan_at": self.last_scan_at,
                 "last_scan_text": datetime.fromtimestamp(self.last_scan_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if self.last_scan_at else "pendiente",
                 "last_error": self.last_error,
+                "last_startup_error": self.last_startup_error,
+                "last_data_warning": self.last_data_warning,
+                "scan_count": self.scan_count,
+                "websocket_messages": self.websocket_messages,
+                "exchange_symbols_count": self.exchange_symbols_count,
+                "min_gain_to_show": MIN_GAIN_TO_SHOW,
+                "include_spot_winners": INCLUDE_SPOT_WINNERS,
                 "entry_levels": ENTRY_LEVELS,
                 "entry_notionals": ENTRY_NOTIONALS,
                 "take_profit_fraction": TAKE_PROFIT_FRACTION,
@@ -432,6 +510,14 @@ HTML = """
     <div class="card"><div class="label">PnL no realizado</div><div id="pnl" class="value">...</div></div>
     <div class="card"><div class="label">Capital en posiciones</div><div id="notional" class="value">...</div></div>
     <div class="card"><div class="label">Último escaneo</div><div id="scan" class="value" style="font-size:16px">...</div></div>
+    <div class="card"><div class="label">Escaneos</div><div id="scanCount" class="value">0</div></div>
+    <div class="card"><div class="label">Contratos futures cargados</div><div id="contracts" class="value">0</div></div>
+    <div class="card"><div class="label">Mensajes WebSocket</div><div id="wsMessages" class="value">0</div></div>
+  </section>
+
+  <section id="errorBox" class="card" style="display:none">
+    <div class="label">Último error / diagnóstico</div>
+    <div id="lastError" class="value negative" style="font-size:16px; word-break: break-word"></div>
   </section>
 
   <section>
@@ -441,7 +527,7 @@ HTML = """
 
   <section>
     <h2>Ganadores detectados</h2>
-    <table><thead><tr><th>Símbolo</th><th>Cambio 24h</th><th>Precio</th><th>Volumen quote</th></tr></thead><tbody id="winners"></tbody></table>
+    <table><thead><tr><th>Símbolo</th><th>Mercado</th><th>Short</th><th>Cambio 24h</th><th>Precio</th><th>Volumen quote</th></tr></thead><tbody id="winners"></tbody></table>
   </section>
 
   <section>
@@ -466,12 +552,18 @@ async function refresh() {
   document.getElementById('pnl').className = 'value ' + cls(data.total_unrealized);
   document.getElementById('notional').textContent = money(data.total_notional);
   document.getElementById('scan').textContent = data.last_scan_text;
+  document.getElementById('scanCount').textContent = data.scan_count;
+  document.getElementById('contracts').textContent = data.exchange_symbols_count;
+  document.getElementById('wsMessages').textContent = data.websocket_messages;
+  const errorText = data.last_error || data.last_data_warning || data.last_startup_error || '';
+  document.getElementById('errorBox').style.display = errorText ? 'block' : 'none';
+  document.getElementById('lastError').textContent = errorText;
   document.getElementById('positions').innerHTML = data.positions.map(p => `
     <tr><td>${p.symbol}</td><td>${pct(p.change)}</td><td>${p.avg_entry.toFixed(8)}</td><td>${p.mark_price.toFixed(8)}</td><td>${money(p.notional)}</td><td>${money(p.target)}</td><td class="${cls(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</td><td>${p.fills.map(f => '<span class="pill">+' + f.level + '% / ' + f.notional + '</span>').join(' ')}</td></tr>
   `).join('') || '<tr><td colspan="8">Sin posiciones abiertas</td></tr>';
   document.getElementById('winners').innerHTML = data.winners.map(w => `
-    <tr><td>${w.symbol}</td><td class="${cls(w.change)}">${pct(w.change)}</td><td>${Number(w.price).toFixed(8)}</td><td>${Number(w.quoteVolume).toLocaleString()}</td></tr>
-  `).join('');
+    <tr><td>${w.symbol}</td><td>${w.market || 'futures'}</td><td>${w.can_short ? 'sí' : 'no'}</td><td class="${cls(w.change)}">${pct(w.change)}</td><td>${Number(w.price).toFixed(8)}</td><td>${Number(w.quoteVolume).toLocaleString()}</td></tr>
+  `).join('') || '<tr><td colspan="6">No hay símbolos para mostrar todavía. Revisa el bloque de errores y eventos.</td></tr>';
   document.getElementById('closed').innerHTML = data.closed_trades.map(t => `
     <tr><td>${t.symbol}</td><td class="positive">${money(t.pnl)}</td><td>${money(t.target)}</td><td>${Number(t.avg_entry).toFixed(8)}</td><td>${Number(t.close_price).toFixed(8)}</td><td>${t.closed_at}</td></tr>
   `).join('') || '<tr><td colspan="6">Sin cierres todavía</td></tr>';
@@ -497,7 +589,8 @@ def status():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "running": bot.running, "mode": bot.snapshot()["mode"]}
+    snapshot = bot.snapshot()
+    return {"ok": True, "running": bot.running, "mode": snapshot["mode"], "last_error": snapshot["last_error"], "scan_count": snapshot["scan_count"]}
 
 
 if __name__ == "__main__":

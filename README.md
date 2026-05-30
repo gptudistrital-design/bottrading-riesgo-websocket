@@ -45,6 +45,8 @@ BINANCE_API_SECRET=tu_api_secret
 | `TAKE_PROFIT_FRACTION` | `0.5` | Ganancia objetivo sobre el notional total. |
 | `SCAN_INTERVAL_SECONDS` | `20` | Frecuencia de escaneo REST de ganadores. |
 | `MAX_SYMBOLS` | `120` | Máximo de ganadores a evaluar por escaneo. |
+| `MIN_GAIN_TO_SHOW` | `0` | Filtro mínimo de porcentaje para mostrar ganadores en la tabla. |
+| `INCLUDE_SPOT_WINNERS` | `true` | Muestra también ganadores spot; solo futures pueden abrir short. |
 | `LEVERAGE` | `1` | Apalancamiento que intentará configurar en modo real. |
 
 ## Ejecutar local
