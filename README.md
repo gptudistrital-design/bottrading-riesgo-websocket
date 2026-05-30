@@ -58,5 +58,5 @@ Abre `http://localhost:8000`.
 
 ## Deploy en Render
 
-El archivo `render.yaml` incluye el servicio web. En Render configura las variables de entorno necesarias y despliega el repositorio.
+El archivo `render.yaml` incluye el servicio web y fija `PYTHON_VERSION=3.12.13` para evitar que Render use Python 3.14, donde dependencias con extensiones nativas pueden compilar desde fuente y fallar. En Render configura las variables de entorno necesarias y despliega el repositorio.
 

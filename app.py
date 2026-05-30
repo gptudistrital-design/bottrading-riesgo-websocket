@@ -26,7 +26,9 @@ from math import floor
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
-import aiohttp
+import urllib.error
+import urllib.request
+
 import websockets
 from flask import Flask, jsonify, render_template_string
 
@@ -42,7 +44,7 @@ QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "120"))
 LEVERAGE = int(os.getenv("LEVERAGE", "1"))
 
-ENTRY_LEVELS = [float(x) for x in os.getenv("ENTRY_LEVELS", "50,100,150,200,250,300").split(",")]
+ENTRY_LEVELS = [float(x) for x in os.getenv("ENTRY_LEVELS", "50,75,100,150,200,250").split(",")]
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
 TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.5"))
 
@@ -88,22 +90,20 @@ class BotPosition:
 
 class BinanceFuturesClient:
     def __init__(self) -> None:
-        self.session: Optional[aiohttp.ClientSession] = None
         self.exchange_filters: Dict[str, Dict[str, float]] = {}
 
     async def start(self) -> None:
-        self.session = aiohttp.ClientSession()
         await self.load_exchange_info()
 
     async def close(self) -> None:
-        if self.session is not None:
-            await self.session.close()
+        return None
 
     async def request(self, method: str, path: str, params: Optional[dict] = None, signed: bool = False) -> Any:
-        if self.session is None:
-            raise RuntimeError("Cliente Binance no iniciado")
+        return await asyncio.to_thread(self._request_sync, method, path, params, signed)
+
+    def _request_sync(self, method: str, path: str, params: Optional[dict] = None, signed: bool = False) -> Any:
         params = dict(params or {})
-        headers = {}
+        headers = {"User-Agent": "BOTTRADINGRIESGO/1.0"}
         if signed:
             if not API_KEY or not API_SECRET:
                 raise RuntimeError("Faltan BINANCE_API_KEY/BINANCE_API_SECRET para trading real")
@@ -116,12 +116,16 @@ class BinanceFuturesClient:
         elif API_KEY:
             headers["X-MBX-APIKEY"] = API_KEY
 
-        url = f"{BASE_URL}{path}"
-        async with self.session.request(method, url, params=params, headers=headers, timeout=15) as response:
-            payload = await response.text()
-            if response.status >= 400:
-                raise RuntimeError(f"Binance HTTP {response.status}: {payload[:300]}")
-            return json.loads(payload)
+        query = urlencode(params, doseq=True)
+        url = f"{BASE_URL}{path}" + (f"?{query}" if query else "")
+        request = urllib.request.Request(url, headers=headers, method=method.upper())
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            payload = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Binance HTTP {exc.code}: {payload[:300]}") from exc
+        return json.loads(payload)
 
     async def load_exchange_info(self) -> None:
         data = await self.request("GET", "/fapi/v1/exchangeInfo")
