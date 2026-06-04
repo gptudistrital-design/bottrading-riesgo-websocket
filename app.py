@@ -159,13 +159,15 @@ class BinanceFuturesClient:
     def _ticker_rows(self, data: list, *, market: str) -> List[dict]:
         winners = []
         for item in data:
-            symbol = item.get("symbol", "")
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or item.get("s") or "").upper()
             if not symbol.endswith(QUOTE_ASSET):
                 continue
             try:
-                change = float(item.get("priceChangePercent", 0.0))
-                last = float(item.get("lastPrice", 0.0))
-                quote_volume = float(item.get("quoteVolume", item.get("volume", 0.0)))
+                change = float(item.get("priceChangePercent", item.get("P", item.get("change", 0.0))))
+                last = float(item.get("lastPrice", item.get("c", item.get("price", 0.0))))
+                quote_volume = float(item.get("quoteVolume", item.get("q", item.get("volume", 0.0))))
             except (TypeError, ValueError):
                 continue
             row = self._build_ticker_row(symbol, change, last, quote_volume, market=market)
@@ -174,13 +176,15 @@ class BinanceFuturesClient:
         return winners
 
     def _build_ticker_row(self, symbol: str, change: float, price: float, quote_volume: float, *, market: str) -> Optional[dict]:
+        symbol = symbol.upper()
         if not symbol.endswith(QUOTE_ASSET):
             return None
         if price <= 0 or change < MIN_GAIN_TO_SHOW:
             return None
-        is_futures = symbol in self.exchange_filters if self.exchange_filters else market == "futures"
-        if market == "futures" and not is_futures:
-            return None
+        # No descartes el ticker solo porque no aparezca en exchangeInfo local.
+        # El código original mostraba esos ganadores y esto evita que un exchangeInfo
+        # incompleto/desfasado deje la primera iteración sin símbolos para revisar.
+        is_futures = market == "futures" and (not self.exchange_filters or symbol in self.exchange_filters)
         return {
             "symbol": symbol,
             "change": change,
