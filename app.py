@@ -288,6 +288,7 @@ class TradingBot:
         self.prices: Dict[str, float] = {}
         self.changes: Dict[str, float] = {}
         self.ticker_cache: Dict[str, dict] = {}
+        self.tracked_symbols: set[str] = set()
         self.winners: List[dict] = []
         self.closed_trades: List[dict] = []
         self.events: List[str] = []
@@ -359,6 +360,8 @@ class TradingBot:
                                 symbol = item.get("s")
                                 if self.client.exchange_filters and symbol not in self.client.exchange_filters:
                                     continue
+                                if self.tracked_symbols and symbol not in self.tracked_symbols:
+                                    continue
                                 price = float(item.get("c", 0.0))
                                 change = float(item.get("P", 0.0))
                                 quote_volume = float(item.get("q", 0.0))
@@ -370,6 +373,7 @@ class TradingBot:
                                         "change": change,
                                         "quoteVolume": quote_volume,
                                         "updated_at": now,
+                                        "source": "websocket",
                                     }
                                     self.websocket_messages += 1
             except Exception as exc:
@@ -386,28 +390,39 @@ class TradingBot:
                 winners = self.client.winners_from_ws_tickers(tickers)
                 tradable_winners = [row for row in winners if row.get("can_short", True)]
                 high_gain = [row for row in winners if row["change"] >= ENTRY_LEVELS[0]]
+                now = time.time()
                 with self.lock:
                     self.winners = winners
                     self.scan_count += 1
+                    self.tracked_symbols = {row["symbol"] for row in winners} | set(self.positions.keys())
                     for row in winners:
-                        self.prices[row["symbol"]] = row["price"]
-                        self.changes[row["symbol"]] = row["change"]
-                    self.last_scan_at = time.time()
+                        symbol = row["symbol"]
+                        self.prices[symbol] = row["price"]
+                        self.changes[symbol] = row["change"]
+                        self.ticker_cache[symbol] = {
+                            "price": row["price"],
+                            "change": row["change"],
+                            "quoteVolume": row.get("quoteVolume", 0.0),
+                            "updated_at": now,
+                            "source": "rest_minute_scan",
+                        }
+                    self.last_scan_at = now
 
-                if not tickers:
-                    self.last_data_warning = "Esperando primeros tickers del WebSocket de futures; no se hará polling REST."
-                    self.log(self.last_data_warning)
-                else:
+                if self.client.last_warning and self.client.last_warning != self.last_data_warning:
+                    self.last_data_warning = self.client.last_warning
+                    self.last_error = self.client.last_warning
+                    self.log(f"Advertencia de datos: {self.client.last_warning}")
+                elif not self.client.last_warning:
                     self.last_data_warning = ""
 
                 top_text = f"{winners[0]['symbol']} {winners[0]['change']:.2f}% ({winners[0].get('market', 'futures')})" if winners else "sin ganadores"
-                self.log(f"Escaneo WS #{self.scan_count}: {len(winners)} símbolos mostrados, {len(high_gain)} >= {ENTRY_LEVELS[0]:.0f}%, shorteables={len(tradable_winners)}, top: {top_text}")
+                self.log(f"Escaneo REST minuto #{self.scan_count}: {len(winners)} símbolos mostrados, {len(high_gain)} >= {ENTRY_LEVELS[0]:.0f}%, shorteables={len(tradable_winners)}, top: {top_text}")
                 self.persist_state()
                 await self._apply_strategy(tradable_winners)
                 self.persist_state()
             except Exception as exc:
                 self.last_error = str(exc)
-                self.log(f"Error en escaneo WS: {exc}")
+                self.log(f"Error en escaneo REST minuto: {exc}")
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
     async def _apply_strategy(self, winners: List[dict]) -> None:
@@ -509,6 +524,7 @@ class TradingBot:
             "scan_count": self.scan_count,
             "websocket_messages": self.websocket_messages,
             "websocket_tickers_count": len(self.ticker_cache),
+            "tracked_symbols_count": len(self.tracked_symbols),
             "exchange_symbols_count": self.exchange_symbols_count,
             "min_gain_to_show": MIN_GAIN_TO_SHOW,
             "include_spot_winners": INCLUDE_SPOT_WINNERS,
