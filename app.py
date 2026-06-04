@@ -312,7 +312,7 @@ class TradingBot:
             self.last_startup_error = str(exc)
             self.last_error = str(exc)
             self.log(f"No se pudo cargar exchangeInfo ({exc}). Continúo con filtros mínimos para mostrar ganadores.")
-        await asyncio.gather(self._price_ws(), self._scanner())
+        await asyncio.gather(self._price_ws(), self._winners_updater(), self._scanner())
 
     async def _price_ws(self) -> None:
         while self.running:
@@ -379,45 +379,60 @@ class TradingBot:
         winners.sort(key=lambda row: row["change"], reverse=True)
         return winners[:MAX_SYMBOLS]
 
+    async def _winners_updater(self) -> None:
+        """
+        Actualiza self.winners cada WINNERS_UPDATE_SECONDS segundos directamente
+        desde los datos en memoria (populados por _price_ws). CERO REST.
+        Esto mantiene la tabla de ganadores dinámica en la UI sin polling.
+        """
+        WINNERS_UPDATE_SECONDS = int(os.getenv("WINNERS_UPDATE_SECONDS", "3"))
+        while self.running:
+            try:
+                if self.websocket_messages > 0:
+                    fresh = self._build_winners_from_ws()
+                    if fresh:
+                        with self.lock:
+                            self.winners = fresh
+            except Exception as exc:
+                self.log(f"Error actualizando ganadores: {exc}")
+            await asyncio.sleep(WINNERS_UPDATE_SECONDS)
+
     async def _scanner(self) -> None:
         while self.running:
             try:
-                # ── Construir ganadores desde datos del WebSocket (CERO REST) ──
-                # El stream !ticker@arr ya nos da precio, cambio 24h y volumen
-                # en tiempo real. Solo si el WS no ha recibido datos todavía
-                # (arranque muy temprano) hacemos UNA sola llamada REST de respaldo.
+                # ── Construir ganadores para la estrategia (CERO REST) ──
+                # _price_ws llena self.prices/changes/quote_volumes continuamente.
+                # _winners_updater ya actualiza self.winners para la UI.
+                # Aquí solo necesitamos la lista fresca para aplicar la estrategia.
                 if self.websocket_messages > 0:
                     winners = self._build_winners_from_ws()
-                    if self.client.last_warning:
-                        self.client.last_warning = ""
                 else:
-                    # Arranque: WS aún no ha llenado datos, esperar un poco
+                    # Arranque: WS aún no ha llenado datos, esperar
                     await asyncio.sleep(5)
                     winners = self._build_winners_from_ws()
                     if not winners:
                         # Último recurso al arrancar: una sola llamada REST
                         try:
                             winners = await self.client.winners_24h()
+                            with self.lock:
+                                self.winners = winners
                         except Exception as exc:
                             self.last_error = str(exc)
                             self.log(f"Error en datos de arranque: {exc}")
                             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
                             continue
+
                 tradable_winners = [row for row in winners if row.get("can_short", True)]
                 high_gain = [row for row in winners if row["change"] >= ENTRY_LEVELS[0]]
+
                 with self.lock:
-                    self.winners = winners
                     self.scan_count += 1
-                    for row in winners:
-                        self.prices[row["symbol"]] = row["price"]
-                        self.changes[row["symbol"]] = row["change"]
                     self.last_scan_at = time.time()
-                if self.client.last_warning and self.client.last_warning != self.last_data_warning:
-                    self.last_data_warning = self.client.last_warning
-                    self.last_error = self.client.last_warning
-                    self.log(f"Advertencia de datos: {self.client.last_warning}")
+                    if self.client.last_warning:
+                        self.client.last_warning = ""
+
                 top_text = f"{winners[0]['symbol']} {winners[0]['change']:.2f}% ({winners[0].get('market', 'futures')})" if winners else "sin ganadores"
-                self.log(f"Escaneo #{self.scan_count}: {len(winners)} símbolos mostrados, {len(high_gain)} >= {ENTRY_LEVELS[0]:.0f}%, shorteables={len(tradable_winners)}, top: {top_text}")
+                self.log(f"Escaneo #{self.scan_count}: {len(winners)} símbolos, {len(high_gain)} >= {ENTRY_LEVELS[0]:.0f}%, shorteables={len(tradable_winners)}, top: {top_text}")
                 self.persist_state()
                 await self._apply_strategy(tradable_winners)
                 self.persist_state()
