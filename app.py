@@ -49,7 +49,7 @@ MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "120"))
 LEVERAGE = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "bottradingriesgo_state.json"))
 
-ENTRY_LEVELS = [float(x) for x in os.getenv("ENTRY_LEVELS", "50,75,100,150,200,250").split(",")]
+ENTRY_LEVELS = [float(x) for x in os.getenv("ENTRY_LEVELS", "20,75,100,150,200,250").split(",")]
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
 TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
 
