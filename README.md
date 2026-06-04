@@ -4,8 +4,8 @@ Aplicación web lista para Render que monitorea los ganadores de Binance USDT-M 
 
 ## Estrategia implementada
 
-- Escanea los ganadores de Binance Futures por `priceChangePercent` de 24h.
-- Usa WebSocket de Binance (`!ticker@arr`) para mantener precios en tiempo real.
+- Actualiza los ganadores de Binance Futures por `priceChangePercent` de 24h con **una** consulta REST controlada por minuto.
+- Usa WebSocket de Binance (`!ticker@arr`) para mantener precios, cambios 24h y volumen en tiempo real entre escaneos, evitando polling agresivo.
 - Abre short en tramos configurables cuando el cambio 24h supera estos niveles:
   - `50%, 75%, 100%, 150%, 200%, 250%`
 - Tamaño de cada tramo:
@@ -43,7 +43,7 @@ BINANCE_API_SECRET=tu_api_secret
 | `ENTRY_LEVELS` | `50,75,100,150,200,250` | Niveles de subida 24h para abrir tramos. |
 | `ENTRY_NOTIONALS` | `5,5,10,20,40,80` | USDT por tramo. |
 | `TAKE_PROFIT_FRACTION` | `0.5` | Ganancia objetivo sobre el notional total. |
-| `SCAN_INTERVAL_SECONDS` | `20` | Frecuencia de escaneo REST de ganadores. |
+| `SCAN_INTERVAL_SECONDS` | `60` | Frecuencia mínima de consulta REST para refrescar ganadores y actualizar la lista seguida por WebSocket. |
 | `MAX_SYMBOLS` | `120` | Máximo de ganadores a evaluar por escaneo. |
 | `MIN_GAIN_TO_SHOW` | `0` | Filtro mínimo de porcentaje para mostrar ganadores en la tabla. |
 | `INCLUDE_SPOT_WINNERS` | `false` | Muestra también ganadores spot si lo activas; solo futures pueden abrir short. |
