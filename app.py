@@ -260,6 +260,7 @@ class TradingBot:
         self.positions: Dict[str, BotPosition] = {}
         self.prices: Dict[str, float] = {}
         self.changes: Dict[str, float] = {}
+        self.quote_volumes: Dict[str, float] = {}
         self.winners: List[dict] = []
         self.closed_trades: List[dict] = []
         self.events: List[str] = []
@@ -330,19 +331,78 @@ class TradingBot:
                                     continue
                                 price = float(item.get("c", 0.0))
                                 change = float(item.get("P", 0.0))
+                                quote_vol = float(item.get("q", 0.0))
                                 if price > 0:
                                     self.prices[symbol] = price
                                     self.changes[symbol] = change
+                                    if quote_vol > 0:
+                                        self.quote_volumes[symbol] = quote_vol
                                     self.websocket_messages += 1
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log(f"WebSocket desconectado: {exc}; reconectando")
                 await asyncio.sleep(5)
 
+    def _build_winners_from_ws(self) -> List[dict]:
+        """
+        Construye la lista de ganadores usando los datos del WebSocket !ticker@arr.
+        CERO llamadas REST. Los datos se actualizan continuamente por _price_ws().
+        """
+        with self.lock:
+            prices = dict(self.prices)
+            changes = dict(self.changes)
+            quote_vols = dict(self.quote_volumes)
+            exchange_filters = self.client.exchange_filters
+
+        winners = []
+        for symbol, price in prices.items():
+            if not symbol.endswith(QUOTE_ASSET):
+                continue
+            if price <= 0:
+                continue
+            change = changes.get(symbol, 0.0)
+            if change < MIN_GAIN_TO_SHOW:
+                continue
+            is_futures = symbol in exchange_filters if exchange_filters else True
+            if not is_futures and not INCLUDE_SPOT_WINNERS:
+                continue
+            winners.append({
+                "symbol": symbol,
+                "change": change,
+                "price": price,
+                "quoteVolume": quote_vols.get(symbol, 0.0),
+                "market": "futures" if is_futures else "spot",
+                "is_futures": is_futures,
+                "can_short": is_futures,
+            })
+
+        winners.sort(key=lambda row: row["change"], reverse=True)
+        return winners[:MAX_SYMBOLS]
+
     async def _scanner(self) -> None:
         while self.running:
             try:
-                winners = await self.client.winners_24h()
+                # ── Construir ganadores desde datos del WebSocket (CERO REST) ──
+                # El stream !ticker@arr ya nos da precio, cambio 24h y volumen
+                # en tiempo real. Solo si el WS no ha recibido datos todavía
+                # (arranque muy temprano) hacemos UNA sola llamada REST de respaldo.
+                if self.websocket_messages > 0:
+                    winners = self._build_winners_from_ws()
+                    if self.client.last_warning:
+                        self.client.last_warning = ""
+                else:
+                    # Arranque: WS aún no ha llenado datos, esperar un poco
+                    await asyncio.sleep(5)
+                    winners = self._build_winners_from_ws()
+                    if not winners:
+                        # Último recurso al arrancar: una sola llamada REST
+                        try:
+                            winners = await self.client.winners_24h()
+                        except Exception as exc:
+                            self.last_error = str(exc)
+                            self.log(f"Error en datos de arranque: {exc}")
+                            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+                            continue
                 tradable_winners = [row for row in winners if row.get("can_short", True)]
                 high_gain = [row for row in winners if row["change"] >= ENTRY_LEVELS[0]]
                 with self.lock:
