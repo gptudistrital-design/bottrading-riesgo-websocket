@@ -10,16 +10,24 @@ Estrategia:
 - Por seguridad arranca en PAPER_MODE=true. Para operar real se requieren
   BINANCE_API_KEY, BINANCE_API_SECRET y LIVE_TRADING=true.
 
-ARQUITECTURA DE DATOS (sin polling REST):
-- !miniTicker@arr (futuras): stream WebSocket de todos los mini-tickers de
-  Binance Futures. Llega cada ~1 segundo con precio actual y cambio 24h de
-  todos los símbolos. Se usa para:
-    1. Mantener self.prices y self.changes actualizados en tiempo real (~1s).
-    2. Recalcular ganadores cada WINNERS_REFRESH_SECONDS (default 60s) leyendo
-       el cache WS sin ninguna llamada REST.
-- El PnL no realizado de posiciones se actualiza cada vez que llega un mensaje
-  del stream, es decir, aproximadamente cada segundo.
-- CERO llamadas REST a /fapi/v1/ticker/24hr → no hay rate-limit 429/418.
+ARQUITECTURA DE DATOS:
+- Fuente primaria — !miniTicker@arr (WebSocket):
+    Stream de Binance Futures que llega ~cada 1s con precio, cambio 24h y
+    volumen de TODOS los símbolos perpetuales. Alimenta self.prices,
+    self.changes y self.quote_volumes en tiempo real. No consume peso REST.
+    El PnL no realizado de posiciones abiertas se actualiza con cada mensaje.
+
+- Respaldo REST — /fapi/v1/ticker/24hr (una sola llamada periódica):
+    Se ejecuta en dos situaciones:
+      1. Arranque: si tras 15s el WS todavía no tiene datos (cold-start).
+      2. Periódicamente cada REST_FALLBACK_SECONDS (default 60s): para capturar
+         símbolos cuyo cambio 24h pudo subir repentinamente y que el cache WS
+         aún no haya propagado con suficiente ganancia visible. La respuesta REST
+         se fusiona (merge) con el cache WS: si el símbolo ya existe en el cache,
+         se actualiza SOLO si el precio REST es más reciente (distinto); si no
+         existe, se añade. Esto garantiza cobertura total sin eliminar datos WS.
+    Una sola llamada REST pesa ~40 tokens (limit=1000) de los 2400/min
+    disponibles — insignificante comparado con llamar cada 20s.
 """
 
 from __future__ import annotations
@@ -54,6 +62,10 @@ FUTURES_TICKER_WS_URL = "wss://fstream.binance.com/ws/!miniTicker@arr"
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
 # Cada cuántos segundos recalculamos la lista de ganadores desde el cache WS
 WINNERS_REFRESH_SECONDS = int(os.getenv("WINNERS_REFRESH_SECONDS", "60"))
+# Cada cuántos segundos se hace la llamada REST de respaldo para capturar
+# símbolos con subidas repentinas que el WS pudo no haber propagado aún.
+# También actúa como cold-start si el WS no tiene datos en los primeros 15s.
+REST_FALLBACK_SECONDS = int(os.getenv("REST_FALLBACK_SECONDS", "60"))
 
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
@@ -237,6 +249,7 @@ class TradingBot:
         self.running = False
         self.last_scan_at = 0.0
         self.last_winners_refresh_at = 0.0
+        self.last_rest_fallback_at = 0.0   # última vez que corrió el respaldo REST
         self.last_error = ""
         self.last_startup_error = ""
         self.last_data_warning = ""
@@ -283,9 +296,11 @@ class TradingBot:
             self.last_error = str(exc)
             self.log(f"No se pudo cargar exchangeInfo ({exc}). Continúo con filtros mínimos.")
 
-        # Arrancamos el stream de mini-tickers y el scanner en paralelo.
-        # El scanner espera a que haya datos WS antes de su primer ciclo.
-        await asyncio.gather(self._ticker_ws(), self._scanner())
+        # Tres tareas paralelas:
+        #   1. _ticker_ws       → alimenta el cache desde WS (~1s)
+        #   2. _rest_fallback_loop → merge REST periódico (cold-start + cada 60s)
+        #   3. _scanner         → aplica estrategia leyendo el cache
+        await asyncio.gather(self._ticker_ws(), self._rest_fallback_loop(), self._scanner())
 
     # =========================================================================
     # WEBSOCKET DE MINI-TICKERS  —  actualiza precios y cambios 24h en tiempo real
@@ -363,13 +378,102 @@ class TradingBot:
                 await self._maybe_take_profit(symbol, price)
 
     # =========================================================================
-    # SCANNER  —  sin llamadas REST, lee del cache WS
+    # RESPALDO REST  —  una llamada periódica para capturar subidas repentinas
+    # =========================================================================
+
+    async def _rest_fallback_merge(self, *, reason: str = "periodic") -> None:
+        """
+        Llama a /fapi/v1/ticker/24hr UNA sola vez y fusiona los resultados
+        con el cache WS existente.
+
+        Regla de merge (sin borrar datos WS):
+          • Símbolo ya en cache WS → se sobreescribe precio, cambio y volumen
+            con los datos REST (más frescos en cambio 24h acumulado).
+          • Símbolo NUEVO (no estaba en el cache WS) → se añade al cache.
+
+        Peso de la llamada: ~40 tokens de 2400/min. Con REST_FALLBACK_SECONDS=60
+        se consume ~40 tokens/min, dejando 2360 para todo lo demás.
+        """
+        try:
+            self.log(f"REST fallback ({reason}): consultando /fapi/v1/ticker/24hr…")
+            data = await self.client.request("GET", "/fapi/v1/ticker/24hr")
+            if not isinstance(data, list):
+                return
+            added = 0
+            updated = 0
+            with self.lock:
+                for item in data:
+                    symbol = item.get("symbol", "")
+                    if not symbol.endswith(QUOTE_ASSET):
+                        continue
+                    if self.client.exchange_filters and symbol not in self.client.exchange_filters:
+                        continue
+                    try:
+                        price = float(item.get("lastPrice", 0.0))
+                        change = float(item.get("priceChangePercent", 0.0))
+                        q_vol = float(item.get("quoteVolume", 0.0))
+                    except (TypeError, ValueError):
+                        continue
+                    if price <= 0:
+                        continue
+                    is_new = symbol not in self.prices
+                    self.prices[symbol] = price
+                    self.changes[symbol] = change
+                    self.quote_volumes[symbol] = q_vol
+                    if is_new:
+                        added += 1
+                    else:
+                        updated += 1
+            self.last_rest_fallback_at = time.time()
+            self.log(
+                f"REST fallback ({reason}): {updated} símbolos actualizados, "
+                f"{added} nuevos añadidos al cache WS"
+            )
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.log(f"REST fallback ({reason}) falló: {exc}")
+
+    async def _rest_fallback_loop(self) -> None:
+        """
+        Tarea de fondo que dispara _rest_fallback_merge cada REST_FALLBACK_SECONDS.
+
+        Primera ejecución:
+          - Si el WS ya tiene datos (arranque normal): espera REST_FALLBACK_SECONDS
+            antes de la primera llamada.
+          - Si el WS NO tiene datos tras 15s (cold-start / red lenta): llama
+            inmediatamente como respaldo de arranque.
+        """
+        # Esperar hasta 15s al WS antes del cold-start fallback
+        for _ in range(30):
+            if not self.running:
+                return
+            with self.lock:
+                has_data = len(self.prices) > 0
+            if has_data:
+                break
+            await asyncio.sleep(0.5)
+
+        with self.lock:
+            has_data = len(self.prices) > 0
+
+        if not has_data:
+            await self._rest_fallback_merge(reason="cold-start")
+        else:
+            # WS ya tiene datos: primera llamada periódica tras REST_FALLBACK_SECONDS
+            await asyncio.sleep(REST_FALLBACK_SECONDS)
+
+        while self.running:
+            await self._rest_fallback_merge(reason="periodic")
+            await asyncio.sleep(REST_FALLBACK_SECONDS)
+
+    # =========================================================================
+    # SCANNER  —  fuente primaria: cache WS; respaldo: _rest_fallback_loop
     # =========================================================================
 
     def _build_winners_from_cache(self) -> List[dict]:
         """
-        Construye la lista de ganadores leyendo SOLO el cache WS (self.prices,
-        self.changes, self.quote_volumes). CERO llamadas REST.
+        Construye la lista de ganadores leyendo el cache (WS + merge REST).
+        No hace ninguna llamada de red.
         """
         winners = []
         with self.lock:
@@ -398,16 +502,18 @@ class TradingBot:
 
     async def _scanner(self) -> None:
         """
-        Ciclo principal del bot. Ya NO llama a ningún endpoint REST para
-        obtener ganadores: lee directamente del cache WebSocket.
+        Ciclo principal del bot.
 
-        - Espera hasta WINNERS_REFRESH_SECONDS para recalcular ganadores.
-        - El scan_count sube cada SCAN_INTERVAL_SECONDS para seguir los
-          eventos tal como antes.
-        - Aplica la estrategia con los precios más recientes del cache WS.
+        Fuente primaria de precios/cambios: cache WS (!miniTicker@arr).
+        Fuente secundaria: merge REST periódico (_rest_fallback_loop).
+
+        - Espera hasta 30s a que alguna de las dos fuentes tenga datos.
+        - Recalcula ganadores cada WINNERS_REFRESH_SECONDS leyendo el cache.
+        - El scan_count sube cada SCAN_INTERVAL_SECONDS como antes.
+        - Aplica la estrategia con los precios más frescos del cache.
         """
-        # Esperar a que el WS empiece a poblar datos (max 30s)
-        self.log("Scanner: esperando datos del WebSocket de mini-tickers…")
+        # Esperar hasta 30s a que el cache tenga datos (WS o respaldo REST)
+        self.log("Scanner: esperando datos del cache (WS o respaldo REST)…")
         for _ in range(60):
             if not self.running:
                 return
@@ -418,7 +524,7 @@ class TradingBot:
             await asyncio.sleep(0.5)
 
         if not self.prices:
-            self.log("Scanner: sin datos WS tras 30s — revisa conectividad")
+            self.log("Scanner: sin datos tras 30s — revisa conectividad")
 
         while self.running:
             try:
