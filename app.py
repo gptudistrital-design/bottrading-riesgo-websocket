@@ -9,6 +9,17 @@ Estrategia:
   capital colocado en esa posición (ej.: 5 USDT -> 2.5 USDT).
 - Por seguridad arranca en PAPER_MODE=true. Para operar real se requieren
   BINANCE_API_KEY, BINANCE_API_SECRET y LIVE_TRADING=true.
+
+ARQUITECTURA DE DATOS (sin polling REST):
+- !miniTicker@arr (futuras): stream WebSocket de todos los mini-tickers de
+  Binance Futures. Llega cada ~1 segundo con precio actual y cambio 24h de
+  todos los símbolos. Se usa para:
+    1. Mantener self.prices y self.changes actualizados en tiempo real (~1s).
+    2. Recalcular ganadores cada WINNERS_REFRESH_SECONDS (default 60s) leyendo
+       el cache WS sin ninguna llamada REST.
+- El PnL no realizado de posiciones se actualiza cada vez que llega un mensaje
+  del stream, es decir, aproximadamente cada segundo.
+- CERO llamadas REST a /fapi/v1/ticker/24hr → no hay rate-limit 429/418.
 """
 
 from __future__ import annotations
@@ -35,8 +46,15 @@ from flask import Flask, jsonify, make_response, render_template_string
 
 
 BASE_URL = os.getenv("BASE_URL", "https://fapi.binance.com")
-WS_URL = os.getenv("WS_URL", "wss://fstream.binance.com/ws/!ticker@arr")
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
+
+# Stream de mini-tickers de futuros: llega ~cada 1s con precio y cambio 24h
+# de TODOS los símbolos perpetuales. No genera ningún peso en el rate-limit REST.
+FUTURES_TICKER_WS_URL = "wss://fstream.binance.com/ws/!miniTicker@arr"
+
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
+# Cada cuántos segundos recalculamos la lista de ganadores desde el cache WS
+WINNERS_REFRESH_SECONDS = int(os.getenv("WINNERS_REFRESH_SECONDS", "60"))
+
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
 API_KEY = os.getenv("BINANCE_API_KEY", "")
@@ -156,59 +174,6 @@ class BinanceFuturesClient:
             filters[symbol_info["symbol"]] = row
         self.exchange_filters = filters
 
-    def _ticker_rows(self, data: list, *, market: str) -> List[dict]:
-        winners = []
-        for item in data:
-            symbol = item.get("symbol", "")
-            if not symbol.endswith(QUOTE_ASSET):
-                continue
-            try:
-                change = float(item.get("priceChangePercent", 0.0))
-                last = float(item.get("lastPrice", 0.0))
-                quote_volume = float(item.get("quoteVolume", item.get("volume", 0.0)))
-            except (TypeError, ValueError):
-                continue
-            if change < MIN_GAIN_TO_SHOW or last <= 0:
-                continue
-            is_futures = symbol in self.exchange_filters if self.exchange_filters else market == "futures"
-            winners.append({
-                "symbol": symbol,
-                "change": change,
-                "price": last,
-                "quoteVolume": quote_volume,
-                "market": market,
-                "is_futures": is_futures,
-                "can_short": is_futures and market == "futures",
-            })
-        return winners
-
-    async def winners_24h(self) -> List[dict]:
-        winners: List[dict] = []
-        warnings: List[str] = []
-
-        try:
-            futures_data = await self.request("GET", "/fapi/v1/ticker/24hr")
-            winners.extend(self._ticker_rows(futures_data, market="futures"))
-        except Exception as exc:
-            warnings.append(f"Futures ticker no disponible: {exc}")
-
-        if INCLUDE_SPOT_WINNERS:
-            try:
-                spot_data = await self.public_request(SPOT_BASE_URL, "/api/v3/ticker/24hr")
-                seen_futures = {row["symbol"] for row in winners}
-                for row in self._ticker_rows(spot_data, market="spot"):
-                    if row["symbol"] not in seen_futures:
-                        winners.append(row)
-            except Exception as exc:
-                warnings.append(f"Spot ticker no disponible: {exc}")
-
-        self.last_warning = " | ".join(warnings)
-        if not winners and warnings:
-            raise RuntimeError(self.last_warning)
-
-        winners.sort(key=lambda row: row["change"], reverse=True)
-        return winners[:MAX_SYMBOLS]
-
     def normalize_qty(self, symbol: str, qty: float) -> float:
         info = self.exchange_filters.get(symbol, {"stepSize": 0.001, "minQty": 0.0})
         step = info["stepSize"]
@@ -258,15 +223,20 @@ class TradingBot:
     def __init__(self) -> None:
         self.client = BinanceFuturesClient()
         self.positions: Dict[str, BotPosition] = {}
+
+        # Cache de precios y cambios 24h alimentado SOLO por WebSocket
+        # Se actualiza ~cada 1 segundo sin ninguna llamada REST.
         self.prices: Dict[str, float] = {}
         self.changes: Dict[str, float] = {}
         self.quote_volumes: Dict[str, float] = {}
+
         self.winners: List[dict] = []
         self.closed_trades: List[dict] = []
         self.events: List[str] = []
         self.lock = threading.Lock()
         self.running = False
         self.last_scan_at = 0.0
+        self.last_winners_refresh_at = 0.0
         self.last_error = ""
         self.last_startup_error = ""
         self.last_data_warning = ""
@@ -311,67 +281,114 @@ class TradingBot:
         except Exception as exc:
             self.last_startup_error = str(exc)
             self.last_error = str(exc)
-            self.log(f"No se pudo cargar exchangeInfo ({exc}). Continúo con filtros mínimos para mostrar ganadores.")
-        await asyncio.gather(self._price_ws(), self._winners_updater(), self._scanner())
+            self.log(f"No se pudo cargar exchangeInfo ({exc}). Continúo con filtros mínimos.")
 
-    async def _price_ws(self) -> None:
+        # Arrancamos el stream de mini-tickers y el scanner en paralelo.
+        # El scanner espera a que haya datos WS antes de su primer ciclo.
+        await asyncio.gather(self._ticker_ws(), self._scanner())
+
+    # =========================================================================
+    # WEBSOCKET DE MINI-TICKERS  —  actualiza precios y cambios 24h en tiempo real
+    # =========================================================================
+
+    async def _ticker_ws(self) -> None:
+        """
+        Se suscribe a !miniTicker@arr en Binance Futures.
+
+        Cada mensaje contiene la lista completa de mini-tickers con:
+          s = symbol
+          c = último precio (close)
+          P = cambio % 24h
+          q = volumen quote 24h
+
+        Este stream llega aproximadamente cada 1 segundo y NO consume
+        ningún peso del rate-limit REST de Binance.
+        """
         while self.running:
             try:
-                async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=10) as ws:
-                    self.log("WebSocket de precios conectado")
+                async with websockets.connect(
+                    FUTURES_TICKER_WS_URL,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    max_size=10 ** 7,
+                ) as ws:
+                    self.log("WebSocket !miniTicker@arr (futuros) conectado — sin polling REST")
                     while self.running:
                         raw = await ws.recv()
                         payload = json.loads(raw)
                         if not isinstance(payload, list):
                             continue
+
                         with self.lock:
                             for item in payload:
-                                symbol = item.get("s")
+                                symbol = item.get("s", "")
+                                if not symbol.endswith(QUOTE_ASSET):
+                                    continue
+                                # Filtrar solo los que están en exchange_filters
+                                # (contratos perpetuos USDT-M activos)
                                 if self.client.exchange_filters and symbol not in self.client.exchange_filters:
                                     continue
-                                price = float(item.get("c", 0.0))
-                                change = float(item.get("P", 0.0))
-                                quote_vol = float(item.get("q", 0.0))
+                                try:
+                                    price = float(item.get("c", 0.0))
+                                    change = float(item.get("P", 0.0))
+                                    q_vol = float(item.get("q", item.get("v", 0.0)))
+                                except (TypeError, ValueError):
+                                    continue
                                 if price > 0:
                                     self.prices[symbol] = price
                                     self.changes[symbol] = change
-                                    if quote_vol > 0:
-                                        self.quote_volumes[symbol] = quote_vol
+                                    self.quote_volumes[symbol] = q_vol
                                     self.websocket_messages += 1
+
+                        # Verificar take-profit en tiempo real (~cada 1s)
+                        # con los precios recién actualizados, sin esperar al scanner.
+                        asyncio.ensure_future(self._realtime_take_profit())
+
             except Exception as exc:
                 self.last_error = str(exc)
-                self.log(f"WebSocket desconectado: {exc}; reconectando")
+                self.log(f"WebSocket ticker desconectado: {exc}; reconectando en 5s")
                 await asyncio.sleep(5)
 
-    def _build_winners_from_ws(self) -> List[dict]:
+    async def _realtime_take_profit(self) -> None:
         """
-        Construye la lista de ganadores usando los datos del WebSocket !ticker@arr.
-        CERO llamadas REST. Los datos se actualizan continuamente por _price_ws().
+        Revisa take-profit en tiempo real con precios del WS.
+        Se llama en cada mensaje WS (~1s). Si no hay posiciones o el lock
+        está ocupado simplemente no hace nada.
         """
         with self.lock:
-            prices = dict(self.prices)
-            changes = dict(self.changes)
-            quote_vols = dict(self.quote_volumes)
-            exchange_filters = self.client.exchange_filters
+            symbols = list(self.positions.keys())
+        for symbol in symbols:
+            price = self.prices.get(symbol)
+            if price:
+                await self._maybe_take_profit(symbol, price)
 
+    # =========================================================================
+    # SCANNER  —  sin llamadas REST, lee del cache WS
+    # =========================================================================
+
+    def _build_winners_from_cache(self) -> List[dict]:
+        """
+        Construye la lista de ganadores leyendo SOLO el cache WS (self.prices,
+        self.changes, self.quote_volumes). CERO llamadas REST.
+        """
         winners = []
-        for symbol, price in prices.items():
-            if not symbol.endswith(QUOTE_ASSET):
+        with self.lock:
+            snapshot_prices = dict(self.prices)
+            snapshot_changes = dict(self.changes)
+            snapshot_volumes = dict(self.quote_volumes)
+
+        for symbol, price in snapshot_prices.items():
+            change = snapshot_changes.get(symbol, 0.0)
+            q_vol = snapshot_volumes.get(symbol, 0.0)
+            if change < MIN_GAIN_TO_SHOW or price <= 0:
                 continue
-            if price <= 0:
-                continue
-            change = changes.get(symbol, 0.0)
-            if change < MIN_GAIN_TO_SHOW:
-                continue
-            is_futures = symbol in exchange_filters if exchange_filters else True
-            if not is_futures and not INCLUDE_SPOT_WINNERS:
-                continue
+            is_futures = symbol in self.client.exchange_filters if self.client.exchange_filters else True
             winners.append({
                 "symbol": symbol,
                 "change": change,
                 "price": price,
-                "quoteVolume": quote_vols.get(symbol, 0.0),
-                "market": "futures" if is_futures else "spot",
+                "quoteVolume": q_vol,
+                "market": "futures",
                 "is_futures": is_futures,
                 "can_short": is_futures,
             })
@@ -379,48 +396,44 @@ class TradingBot:
         winners.sort(key=lambda row: row["change"], reverse=True)
         return winners[:MAX_SYMBOLS]
 
-    async def _winners_updater(self) -> None:
-        """
-        Actualiza self.winners cada WINNERS_UPDATE_SECONDS segundos directamente
-        desde los datos en memoria (populados por _price_ws). CERO REST.
-        Esto mantiene la tabla de ganadores dinámica en la UI sin polling.
-        """
-        WINNERS_UPDATE_SECONDS = int(os.getenv("WINNERS_UPDATE_SECONDS", "3"))
-        while self.running:
-            try:
-                if self.websocket_messages > 0:
-                    fresh = self._build_winners_from_ws()
-                    if fresh:
-                        with self.lock:
-                            self.winners = fresh
-            except Exception as exc:
-                self.log(f"Error actualizando ganadores: {exc}")
-            await asyncio.sleep(WINNERS_UPDATE_SECONDS)
-
     async def _scanner(self) -> None:
+        """
+        Ciclo principal del bot. Ya NO llama a ningún endpoint REST para
+        obtener ganadores: lee directamente del cache WebSocket.
+
+        - Espera hasta WINNERS_REFRESH_SECONDS para recalcular ganadores.
+        - El scan_count sube cada SCAN_INTERVAL_SECONDS para seguir los
+          eventos tal como antes.
+        - Aplica la estrategia con los precios más recientes del cache WS.
+        """
+        # Esperar a que el WS empiece a poblar datos (max 30s)
+        self.log("Scanner: esperando datos del WebSocket de mini-tickers…")
+        for _ in range(60):
+            if not self.running:
+                return
+            with self.lock:
+                has_data = len(self.prices) > 0
+            if has_data:
+                break
+            await asyncio.sleep(0.5)
+
+        if not self.prices:
+            self.log("Scanner: sin datos WS tras 30s — revisa conectividad")
+
         while self.running:
             try:
-                # ── Construir ganadores para la estrategia (CERO REST) ──
-                # _price_ws llena self.prices/changes/quote_volumes continuamente.
-                # _winners_updater ya actualiza self.winners para la UI.
-                # Aquí solo necesitamos la lista fresca para aplicar la estrategia.
-                if self.websocket_messages > 0:
-                    winners = self._build_winners_from_ws()
-                else:
-                    # Arranque: WS aún no ha llenado datos, esperar
-                    await asyncio.sleep(5)
-                    winners = self._build_winners_from_ws()
-                    if not winners:
-                        # Último recurso al arrancar: una sola llamada REST
-                        try:
-                            winners = await self.client.winners_24h()
-                            with self.lock:
-                                self.winners = winners
-                        except Exception as exc:
-                            self.last_error = str(exc)
-                            self.log(f"Error en datos de arranque: {exc}")
-                            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-                            continue
+                now = time.time()
+
+                # Recalcular ganadores cada WINNERS_REFRESH_SECONDS (default 60s)
+                # en lugar de cada 20s con una llamada REST.
+                if now - self.last_winners_refresh_at >= WINNERS_REFRESH_SECONDS:
+                    winners = self._build_winners_from_cache()
+                    with self.lock:
+                        self.winners = winners
+                        self.last_winners_refresh_at = now
+
+                with self.lock:
+                    winners = list(self.winners)
 
                 tradable_winners = [row for row in winners if row.get("can_short", True)]
                 high_gain = [row for row in winners if row["change"] >= ENTRY_LEVELS[0]]
@@ -428,17 +441,24 @@ class TradingBot:
                 with self.lock:
                     self.scan_count += 1
                     self.last_scan_at = time.time()
-                    if self.client.last_warning:
-                        self.client.last_warning = ""
 
-                top_text = f"{winners[0]['symbol']} {winners[0]['change']:.2f}% ({winners[0].get('market', 'futures')})" if winners else "sin ganadores"
-                self.log(f"Escaneo #{self.scan_count}: {len(winners)} símbolos, {len(high_gain)} >= {ENTRY_LEVELS[0]:.0f}%, shorteables={len(tradable_winners)}, top: {top_text}")
+                top_text = (
+                    f"{winners[0]['symbol']} {winners[0]['change']:.2f}% ({winners[0].get('market', 'futures')})"
+                    if winners else "sin ganadores"
+                )
+                self.log(
+                    f"Escaneo #{self.scan_count}: {len(winners)} símbolos mostrados, "
+                    f"{len(high_gain)} >= {ENTRY_LEVELS[0]:.0f}%, "
+                    f"shorteables={len(tradable_winners)}, top: {top_text}"
+                )
                 self.persist_state()
                 await self._apply_strategy(tradable_winners)
                 self.persist_state()
+
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log(f"Error en escaneo: {exc}")
+
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
     async def _apply_strategy(self, winners: List[dict]) -> None:
@@ -447,6 +467,7 @@ class TradingBot:
                 continue
             symbol = row["symbol"]
             change = row["change"]
+            # Siempre usar el precio más fresco del cache WS
             price = self.prices.get(symbol, row["price"])
             if price <= 0:
                 continue
@@ -572,7 +593,6 @@ class TradingBot:
     def persist_state(self) -> None:
         with self.lock:
             data = self._current_snapshot_unlocked()
-        # Evita reemplazar un estado útil por un arranque vacío.
         if data["scan_count"] <= 0 and not data["positions"] and not data["winners"]:
             return
         tmp_path = f"{self.state_file}.tmp"
@@ -623,12 +643,13 @@ HTML = """
     h2 { margin: 8px 0; }
     pre { padding: 14px; overflow: auto; max-height: 300px; white-space: pre-wrap; }
     .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; background: #1e293b; border: 1px solid #475569; }
+    .ws-badge { display: inline-block; padding: 2px 8px; border-radius: 6px; background: #14532d; color: #86efac; font-size: 12px; font-weight: 600; margin-left: 8px; vertical-align: middle; }
   </style>
 </head>
 <body>
 <header>
-  <h1>Bot Short de Símbolos Ganadores Binance Futures</h1>
-  <p>Abre shorts al superar +50% y agrega tramos hasta +250%. Cierra cuando el PnL llega al 50% del notional.</p>
+  <h1>Bot Short de Símbolos Ganadores Binance Futures <span class="ws-badge">WebSocket-only · 0 REST polling</span></h1>
+  <p>Abre shorts al superar +50% y agrega tramos hasta +250%. Cierra cuando el PnL llega al 50% del notional. Precios y cambios actualizados cada ~1s vía !miniTicker@arr.</p>
 </header>
 <main>
   <section class="cards">
@@ -650,7 +671,7 @@ HTML = """
 
   <section>
     <h2>Posiciones abiertas</h2>
-    <table><thead><tr><th>Símbolo</th><th>Cambio 24h</th><th>Entrada media</th><th>Precio</th><th>Notional</th><th>Objetivo</th><th>PnL</th><th>Tramos</th></tr></thead><tbody id="positions">
+    <table><thead><tr><th>Símbolo</th><th>Cambio 24h</th><th>Entrada media</th><th>Precio (WS ~1s)</th><th>Notional</th><th>Objetivo</th><th>PnL (tiempo real)</th><th>Tramos</th></tr></thead><tbody id="positions">
       {% for p in snapshot.positions %}
       <tr><td>{{ p.symbol }}</td><td>{{ "%.2f"|format(p.change) }}%</td><td>{{ "%.8f"|format(p.avg_entry) }}</td><td>{{ "%.8f"|format(p.mark_price) }}</td><td>{{ "%.4f"|format(p.notional) }} USDT</td><td>{{ "%.4f"|format(p.target) }} USDT</td><td class="{{ 'positive' if p.unrealized_pnl >= 0 else 'negative' }}">{{ "%.4f"|format(p.unrealized_pnl) }} USDT</td><td>{% for f in p.fills %}<span class="pill">+{{ "%.0f"|format(f.level) }}% / {{ "%.2f"|format(f.notional) }}</span> {% endfor %}</td></tr>
       {% else %}
@@ -683,7 +704,7 @@ HTML = """
 
   <section>
     <h2>Eventos</h2>
-    <pre id="events">{{ snapshot.events|join("\n") }}</pre>
+    <pre id="events">{{ snapshot.events|join("\\n") }}</pre>
   </section>
 
   <section>
@@ -734,14 +755,14 @@ function renderStatus(data) {
   document.getElementById('closed').innerHTML = rowsOrFallback(closedTrades.map(t => `
     <tr><td>${t.symbol || ''}</td><td class="positive">${money(t.pnl)}</td><td>${money(t.target)}</td><td>${fixed(t.avg_entry)}</td><td>${fixed(t.close_price)}</td><td>${t.closed_at || ''}</td></tr>
   `), '<tr><td colspan="6">Sin cierres todavía</td></tr>');
-  document.getElementById('events').textContent = events.join('\n');
+  document.getElementById('events').textContent = events.join('\\n');
   document.getElementById('rawStatus').textContent = JSON.stringify(data, null, 2);
 }
 function renderClientError(error) {
   const message = 'Error de la página consultando /api/status: ' + error.message;
   document.getElementById('errorBox').style.display = 'block';
   document.getElementById('lastError').textContent = message;
-  document.getElementById('events').textContent = message + '\n' + document.getElementById('events').textContent;
+  document.getElementById('events').textContent = message + '\\n' + document.getElementById('events').textContent;
 }
 async function refresh() {
   try {
