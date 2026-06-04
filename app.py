@@ -4,15 +4,15 @@ Bot web para shortear ganadores de Binance Futures.
 ARQUITECTURA CORRECTA:
 ════════════════════════════════════════════════════════════════════════════
  1. REST cada 60 s  → /fapi/v1/ticker/24hr
-      Solo para descubrir los TOP 20 símbolos ganadores por cambio 24h.
+      Solo para descubrir los TOP 30 símbolos ganadores por cambio 24h.
       Una sola llamada, ~5 tokens REST. Guarda symbol + change + precio inicial.
 
- 2. SymbolWebSocketPriceCache (WS.py)  → markPrice@1s de los 20 símbolos
+ 2. SymbolWebSocketPriceCache (WS.py)  → markPrice@1s de los 30 símbolos
       Precio en tiempo real para: evaluar TP de posiciones abiertas y
       mostrar precios actualizados en la tabla de ganadores y posiciones.
       Se re-suscribe cuando la lista de 30 símbolos cambia.
 
- 3. KlineWebSocketCache (KlineWebSocketCache_v4.py)  → klines 1m de los 20
+ 3. KlineWebSocketCache (KlineWebSocketCache_v4.py)  → klines 1m de los 30
       Velas en tiempo real para verificar condiciones técnicas de entrada
       antes de abrir un tramo short.
       Se re-inicia cuando la lista cambia (backfill rápido).
@@ -25,9 +25,9 @@ ARQUITECTURA CORRECTA:
       Comprueba take-profit de posiciones abiertas usando precios WS.
       No usa REST.
 
- 6. Flask SSE  →  /api/stream
-      Envía snapshot JSON cada ~1 s al navegador.
-      El navegador actualiza el DOM por script (sin recarga de página).
+ 6. fetch() polling desde el navegador → /api/status cada 2 s
+      Actualiza el DOM por JS sin recargar la página.
+      Compatible con cualquier worker de Gunicorn (sync, gthread, gevent).
       El navegador NO se conecta directamente a Binance.
 ════════════════════════════════════════════════════════════════════════════
 """
@@ -51,7 +51,7 @@ from urllib.parse import urlencode
 import urllib.error
 import urllib.request
 
-from flask import Flask, Response, make_response, render_template_string, stream_with_context
+from flask import Flask, jsonify, make_response, render_template_string
 
 # ── Importar los módulos WS del mismo directorio ──────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -76,7 +76,7 @@ LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
 
 # Cuántos ganadores seguir (top N por cambio 24h)
-TOP_WINNERS          = int(os.getenv("TOP_WINNERS",          "20"))
+TOP_WINNERS          = int(os.getenv("TOP_WINNERS",          "30"))
 # Cada cuántos segundos refrescar la lista de ganadores por REST
 WINNERS_REFRESH_SECS = int(os.getenv("WINNERS_REFRESH_SECS", "60"))
 # Cada cuántos segundos corre el scanner de entrada
@@ -354,7 +354,7 @@ class TradingBot:
         pairs = {sym: ["1m"] for sym in symbols}
         self.kline_cache = KlineWebSocketCache(
             pairs             = pairs,
-            max_candles       = 3,
+            max_candles       = 200,
             include_open_candle = True,
             backfill_on_start = True,
             streams_per_connection = 30,
@@ -567,10 +567,10 @@ class TradingBot:
                 self.last_error = str(exc)
             await asyncio.sleep(0.25)
 
-    # ── Snapshot SSE (actualiza el JSON que el endpoint /api/stream envía) ────
+    # ── Snapshot loop (mantiene _sse_snapshot y sirve /api/status) ─────────────
 
     async def _snapshot_loop(self) -> None:
-        """Reconstruye el snapshot JSON cada segundo para el SSE."""
+        """Reconstruye el snapshot JSON cada segundo para /api/status."""
         while self.running:
             try:
                 snap = self._build_snapshot()
@@ -642,7 +642,7 @@ class TradingBot:
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
     def _build_snapshot(self) -> dict:
-        """Construye el snapshot completo para SSE / API. Thread-safe."""
+        """Construye el snapshot completo para /api/status. Thread-safe."""
         # Precios en tiempo real del WS cache
         all_prices = self.price_cache.get_all_prices() if self.price_cache else {}
         ws_stats   = self.price_cache.get_stats()       if self.price_cache else {}
@@ -759,7 +759,7 @@ class TradingBot:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FLASK APP + SSE
+# FLASK APP
 # ─────────────────────────────────────────────────────────────────────────────
 
 bot = TradingBot()
@@ -769,7 +769,7 @@ app = Flask(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTML + JS (SSE — sin conexión directa a Binance desde el navegador)
+# HTML + JS (fetch polling — sin conexión directa a Binance desde el navegador)
 # ─────────────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!doctype html>
@@ -819,7 +819,7 @@ HTML = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <span id="sseDot"></span>
+  <span id="dotPoll" title="Verde = polling activo"></span>
   <h1>Bot Short Ganadores · Binance USDT-M Futures</h1>
   <span id="modeBadge" class="badge badge-yellow">—</span>
   <span class="badge badge-green">Precios WS en tiempo real</span>
@@ -848,7 +848,7 @@ HTML = r"""<!doctype html>
       <div class="ws-chip">kline pares: <b id="klPairs">—</b></div>
       <div class="ws-chip">kline msgs: <b id="klMsgs">—</b></div>
       <div class="ws-chip">kline conns: <b id="klConns">—</b></div>
-      <div class="ws-chip">SSE msgs recibidos: <b id="sseCount">0</b></div>
+      <div class="ws-chip">Actualizaciones fetch: <b id="pollCount">0</b></div>
     </div>
   </div>
 
@@ -904,10 +904,10 @@ HTML = r"""<!doctype html>
 </main>
 
 <script>
-// ── Utilidades ────────────────────────────────────────────────────────────────
-const q  = id => document.getElementById(id);
-const n  = v  => { const p = Number(v); return isFinite(p) ? p : 0; };
-const fx = (v, d=8) => n(v).toFixed(d);
+// ── Utilidades ─────────────────────────────────────────────────────────────────
+const q     = id => document.getElementById(id);
+const n     = v  => { const p = Number(v); return isFinite(p) ? p : 0; };
+const fx    = (v, d=8) => n(v).toFixed(d);
 const money = v  => fx(v,4) + ' USDT';
 const pct   = v  => fx(v,2) + '%';
 const cls   = v  => n(v) >= 0 ? 'positive' : 'negative';
@@ -917,48 +917,44 @@ function tb(rows, fallback, cols) {
     : `<tr><td colspan="${cols}" style="color:var(--muted)">${fallback}</td></tr>`;
 }
 
-let sseCount = 0;
+let pollCount = 0;
+const dot = q('dotPoll');
 
 // ── Render ─────────────────────────────────────────────────────────────────────
 function render(d) {
-  sseCount++;
-  q('sseCount').textContent = sseCount;
-
-  // KPIs
+  if (!d) return;
   const mode = d.mode || '—';
-  q('mode').textContent = mode;
-  q('modeBadge').textContent = mode;
-  q('modeBadge').className = 'badge ' + (mode === 'REAL' ? 'badge-green' : 'badge-yellow');
+  q('mode').textContent        = mode;
+  q('modeBadge').textContent   = mode;
+  q('modeBadge').className     = 'badge ' + (mode === 'REAL' ? 'badge-green' : 'badge-yellow');
 
   const pu = n(d.total_unrealized);
-  q('pnl').textContent  = money(pu);
-  q('pnl').className    = 'value ' + cls(pu);
-  q('notional').textContent = money(d.total_notional);
-  q('scan').textContent     = d.last_scan_text || 'pendiente';
-  q('scanCount').textContent = n(d.scan_count);
+  q('pnl').textContent         = money(pu);
+  q('pnl').className           = 'value ' + cls(pu);
+  q('notional').textContent    = money(d.total_notional);
+  q('scan').textContent        = d.last_scan_text    || 'pendiente';
+  q('scanCount').textContent   = n(d.scan_count);
   q('lastWinners').textContent = d.last_winners_text || 'pendiente';
   q('contracts').textContent   = n(d.exchange_symbols);
   q('subCount').textContent    = n(d.subscribed_count);
 
-  // WS stats
-  const pw = d.price_ws || {};
-  const kw = d.kline_ws || {};
-  q('wsActive').textContent = n(pw.active);
-  q('wsTotal').textContent  = n(pw.total);
-  q('wsStale').textContent  = n(pw.stale);
-  q('klPairs').textContent  = n(kw.pairs_with_data);
-  q('klMsgs').textContent   = n(kw.total_messages);
-  q('klConns').textContent  = n(kw.active_conns);
+  const pw = d.price_ws || {}, kw = d.kline_ws || {};
+  q('wsActive').textContent  = n(pw.active);
+  q('wsTotal').textContent   = n(pw.total);
+  q('wsStale').textContent   = n(pw.stale);
+  q('klPairs').textContent   = n(kw.pairs_with_data);
+  q('klMsgs').textContent    = n(kw.total_messages);
+  q('klConns').textContent   = n(kw.active_conns);
+  q('pollCount').textContent = pollCount;
 
-  // Error
   const err = d.last_error || d.last_startup_err || '';
   q('errorBox').style.display = err ? 'block' : 'none';
   q('lastError').textContent  = err;
 
-  // Posiciones
+  // ── Posiciones ───────────────────────────────────────────────────────────────
   const positions = Array.isArray(d.positions) ? d.positions : [];
   q('tbPositions').innerHTML = tb(positions.map(p => {
-    const pnl = n(p.unrealized_pnl);
+    const pnl   = n(p.unrealized_pnl);
     const fills = (Array.isArray(p.fills) ? p.fills : [])
       .map(f => `<span class="pill">+${fx(f.level,0)}% / ${fx(f.notional,2)}</span>`)
       .join(' ');
@@ -974,25 +970,23 @@ function render(d) {
     </tr>`;
   }), 'Sin posiciones abiertas', 8);
 
-  // Ganadores
-  const winners = Array.isArray(d.winners) ? d.winners : [];
+  // ── Ganadores ────────────────────────────────────────────────────────────────
+  const winners     = Array.isArray(d.winners) ? d.winners : [];
+  const entryLevels = Array.isArray(d.entry_levels) ? d.entry_levels : [50];
   q('winnerCount').textContent = winners.length;
   q('tbWinners').innerHTML = tb(winners.map(w => {
-    const change = n(w.change);
-    // Resaltar fondo si supera el primer nivel de entrada
-    const entryLevels = Array.isArray(d.entry_levels) ? d.entry_levels : [50];
+    const change   = n(w.change);
     const canTrade = change >= entryLevels[0];
-    const rowStyle = canTrade ? 'background:rgba(34,197,94,0.05)' : '';
-    return `<tr style="${rowStyle}">
+    return `<tr style="${canTrade ? 'background:rgba(34,197,94,0.05)' : ''}">
       <td><a class="sym-link" href="https://www.binance.com/en/futures/${w.symbol}" target="_blank">${w.symbol}</a></td>
       <td class="${cls(change)}">${pct(change)}</td>
       <td>${fx(n(w.price))}</td>
       <td>${canTrade ? '<span style="color:var(--green)">✓ alcista</span>' : '<span style="color:var(--muted)">—</span>'}</td>
       <td>${w.can_short ? '<span style="color:var(--green)">sí</span>' : '<span style="color:var(--red)">no</span>'}</td>
     </tr>`;
-  }), 'No hay ganadores aún — esperando REST...', 5);
+  }), 'No hay ganadores aún…', 5);
 
-  // Cierres
+  // ── Cierres ──────────────────────────────────────────────────────────────────
   const closed = Array.isArray(d.closed_trades) ? d.closed_trades : [];
   q('tbClosed').innerHTML = tb(closed.map(t => `<tr>
     <td>${t.symbol || ''}</td>
@@ -1003,48 +997,38 @@ function render(d) {
     <td style="color:var(--muted)">${t.closed_at || ''}</td>
   </tr>`), 'Sin cierres aún', 6);
 
-  // Eventos
-  const events = Array.isArray(d.events) ? d.events : [];
-  q('events').textContent = events.join('\n');
+  q('events').textContent = (Array.isArray(d.events) ? d.events : []).join('\n');
 }
 
-// ── SSE — única fuente de actualización (no hay conexión directa a Binance) ──
-const dot = q('sseDot');
-let evtSrc = null;
-let sseReconnectTimer = null;
-let sseDelay = 2000;
+// ── Polling con fetch() cada 2 s ───────────────────────────────────────────────
+// No usa SSE ni WebSocket. Llama /api/status con fetch() y actualiza el DOM.
+// Funciona con CUALQUIER tipo de worker de Gunicorn (sync, gthread, gevent).
+// No genera WORKER TIMEOUT porque cada petición dura < 100 ms.
+let pollTimer   = null;
+let pollDelay   = 2000;   // ms entre llamadas
+let pollFailing = false;
 
-function connectSSE() {
-  if (evtSrc) { try { evtSrc.close(); } catch(_) {} evtSrc = null; }
-  evtSrc = new EventSource('/api/stream');
-
-  evtSrc.onopen = () => {
+async function poll() {
+  try {
+    const resp = await fetch('/api/status', { cache: 'no-store' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    pollCount++;
     dot.className = 'on';
-    sseDelay = 2000;
-  };
-
-  evtSrc.onmessage = (evt) => {
-    try {
-      const data = JSON.parse(evt.data);
-      render(data);
-    } catch(e) {
-      console.error('SSE parse error', e);
-    }
-  };
-
-  evtSrc.onerror = () => {
+    pollDelay     = 2000;
+    pollFailing   = false;
+    render(data);
+  } catch (err) {
     dot.className = '';
-    evtSrc.close();
-    evtSrc = null;
-    // Reconectar con backoff
-    sseDelay = Math.min(sseDelay * 1.5, 30000);
-    if (sseReconnectTimer) clearTimeout(sseReconnectTimer);
-    sseReconnectTimer = setTimeout(connectSSE, sseDelay);
-  };
+    if (!pollFailing) { console.warn('Poll error:', err.message); pollFailing = true; }
+    pollDelay = Math.min(pollDelay * 1.5, 15000);  // backoff suave al fallar
+  } finally {
+    pollTimer = setTimeout(poll, pollDelay);
+  }
 }
 
-connectSSE();
-window.addEventListener('beforeunload', () => { if (evtSrc) evtSrc.close(); });
+poll();  // arranca inmediatamente
+window.addEventListener('beforeunload', () => { if (pollTimer) clearTimeout(pollTimer); });
 </script>
 </body>
 </html>
@@ -1061,37 +1045,6 @@ def index():
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
 
-
-@app.get("/api/stream")
-def sse_stream():
-    """
-    Server-Sent Events: envía el snapshot JSON cada ~1 s al navegador.
-    El navegador actualiza el DOM por JS sin recargar la página ni
-    conectarse directamente a Binance.
-    """
-    def generate():
-        last_json = None
-        try:
-            # Heartbeat inicial para que el navegador sepa que conectó
-            yield ": connected\n\n"
-            while True:
-                snap_json = getattr(bot, "_sse_snapshot", "{}")
-                if snap_json and snap_json != last_json:
-                    yield f"data: {snap_json}\n\n"
-                    last_json = snap_json
-                time.sleep(0.8)
-        except GeneratorExit:
-            pass
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control":   "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection":      "keep-alive",
-        },
-    )
 
 
 @app.get("/api/status")
