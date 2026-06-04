@@ -36,7 +36,7 @@ from flask import Flask, jsonify, make_response, render_template_string
 
 BASE_URL = os.getenv("BASE_URL", "https://fapi.binance.com")
 WS_URL = os.getenv("WS_URL", "wss://fstream.binance.com/ws/!ticker@arr")
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
 API_KEY = os.getenv("BINANCE_API_KEY", "")
