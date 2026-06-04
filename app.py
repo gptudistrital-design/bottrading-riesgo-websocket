@@ -49,7 +49,7 @@ MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "120"))
 LEVERAGE = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "bottradingriesgo_state.json"))
 
-ENTRY_LEVELS = [float(x) for x in os.getenv("ENTRY_LEVELS", "50,75,100,150,200,250").split(",")]
+ENTRY_LEVELS = [float(x) for x in os.getenv("ENTRY_LEVELS", "20,75,100,150,200,250").split(",")]
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
 TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
 
@@ -388,7 +388,10 @@ class TradingBot:
     async def _scanner(self) -> None:
         while self.running:
             try:
-                winners = await self.client.winners_24h()
+                with self.lock:
+                    tickers = dict(self.ticker_cache)
+
+                winners = self.client.winners_from_ws_tickers(tickers)
                 tradable_winners = [row for row in winners if row.get("can_short", True)]
                 high_gain = [row for row in winners if row["change"] >= ENTRY_LEVELS[0]]
                 now = time.time()

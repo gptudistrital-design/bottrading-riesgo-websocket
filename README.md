@@ -46,7 +46,7 @@ BINANCE_API_SECRET=tu_api_secret
 | `SCAN_INTERVAL_SECONDS` | `60` | Frecuencia mínima de consulta REST para refrescar ganadores y actualizar la lista seguida por WebSocket. |
 | `MAX_SYMBOLS` | `120` | Máximo de ganadores a evaluar por escaneo. |
 | `MIN_GAIN_TO_SHOW` | `0` | Filtro mínimo de porcentaje para mostrar ganadores en la tabla. |
-| `INCLUDE_SPOT_WINNERS` | `false` | Muestra también ganadores spot si lo activas; solo futures pueden abrir short. |
+| `INCLUDE_SPOT_WINNERS` | `false` | Conservado solo para el fallback manual REST; el escaneo operativo usa futures por WebSocket. |
 | `LEVERAGE` | `1` | Apalancamiento que intentará configurar en modo real. |
 | `STATE_FILE` | `/tmp/bottradingriesgo_state.json` | Archivo usado para compartir el último estado útil entre reinicios/workers. |
 
