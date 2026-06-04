@@ -11,7 +11,7 @@ services:
       - key: PAPER_MODE
         value: "true"
       - key: SCAN_INTERVAL_SECONDS
-        value: "20"
+        value: "60"
       - key: INCLUDE_SPOT_WINNERS
         value: "false"
       - key: BASE_URL
