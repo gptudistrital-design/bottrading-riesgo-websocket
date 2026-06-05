@@ -29,6 +29,10 @@ ARQUITECTURA CORRECTA:
       Actualiza el DOM por JS sin recargar la página.
       Compatible con cualquier worker de Gunicorn (sync, gthread, gevent).
       El navegador NO se conecta directamente a Binance.
+
+ 7. Cooldown de 24 h tras cierre ganador
+      Una vez cerrada una posición con take-profit, el símbolo queda bloqueado
+      durante 86 400 s. El tiempo restante es visible en la tabla de ganadores.
 ════════════════════════════════════════════════════════════════════════════
 """
 
@@ -83,6 +87,8 @@ WINNERS_REFRESH_SECS = int(os.getenv("WINNERS_REFRESH_SECS", "60"))
 SCAN_INTERVAL_SECS   = int(os.getenv("SCAN_INTERVAL_SECS",   "10"))
 # Cambio mínimo 24h para mostrar en tabla (0 = todos los ganadores)
 MIN_GAIN_TO_SHOW     = float(os.getenv("MIN_GAIN_TO_SHOW",   "0"))
+# Segundos de bloqueo tras cerrar una posición con ganancia (por defecto 24 h)
+COOLDOWN_SECONDS     = int(os.getenv("COOLDOWN_SECONDS", "86400"))
 
 ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150,200,250").split(",")]
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
@@ -233,10 +239,15 @@ class TradingBot:
     def __init__(self) -> None:
         self.client   = BinanceFuturesClient()
         self.positions: Dict[str, BotPosition] = {}
-        self.winners:   List[dict] = []          # top 30 con change 24h (REST)
+        self.winners:   List[dict] = []          # top N con change 24h (REST)
         self.closed_trades: List[dict] = []
         self.events:        List[str] = []
         self.lock = threading.Lock()
+
+        # ── Cooldown: symbol → timestamp hasta el que está bloqueado ──────────
+        # Se registra al cerrar una posición con take-profit.
+        # _ensure_short verifica este dict antes de abrir cualquier tramo.
+        self.symbol_cooldown: Dict[str, float] = {}
 
         # WS caches — se crean/recrean dinámicamente
         self.price_cache:  Optional[SymbolWebSocketPriceCache] = None
@@ -354,7 +365,7 @@ class TradingBot:
             return
         self.price_cache = SymbolWebSocketPriceCache(
             symbols,
-            symbols_per_connection=30,   # todos en una sola conexión combinada
+            symbols_per_connection=30,
         )
         self.price_cache.start()
         self.log(f"PriceCache iniciado con {len(symbols)} símbolos")
@@ -384,10 +395,7 @@ class TradingBot:
         """
         Compara la lista nueva con la suscrita.
         Si hay cambios: re-suscribe price_cache y kline_cache.
-
-        Protección importante:
-        - Siempre mantiene suscritos también los símbolos con posición abierta.
-        - Así, aunque salgan del top 30, siguen recibiendo markPrice y klines.
+        Siempre mantiene suscritos los símbolos con posición abierta.
         """
         merged_symbols = self._merged_ws_symbols(new_symbols)
 
@@ -397,18 +405,17 @@ class TradingBot:
         removed = old_set - new_set
 
         if not added and not removed:
-            return  # Sin cambios
+            return
 
         self.log(
             f"Actualización de suscripciones: +{len(added)} síms nuevos, -{len(removed)} eliminados"
         )
 
-        # Reiniciar en threads para no bloquear el event loop
         await asyncio.to_thread(self._start_price_cache, merged_symbols)
         await asyncio.to_thread(self._start_kline_cache, merged_symbols)
         self.subscribed_symbols = list(merged_symbols)
 
-    # ── REST: Top 30 ganadores ────────────────────────────────────────────────
+    # ── REST: Top ganadores ───────────────────────────────────────────────────
 
     async def _fetch_top_winners(self) -> None:
         """
@@ -423,7 +430,7 @@ class TradingBot:
                 self.log("REST: respuesta inesperada (no es lista)")
                 return
 
-            filters = self.client.exchange_filters  # puede estar vacío en cold-start
+            filters = self.client.exchange_filters
 
             candidates = []
             for item in data:
@@ -440,23 +447,22 @@ class TradingBot:
                 if price <= 0 or change < MIN_GAIN_TO_SHOW:
                     continue
                 candidates.append({
-                    "symbol":      symbol,
-                    "change":      change,
-                    "price":       price,   # precio inicial; se actualiza con WS
-                    "market":      "futures",
-                    "can_short":   True,
+                    "symbol":    symbol,
+                    "change":    change,
+                    "price":     price,
+                    "market":    "futures",
+                    "can_short": True,
                 })
 
             candidates.sort(key=lambda x: x["change"], reverse=True)
             top = candidates[:TOP_WINNERS]
             new_symbols = [w["symbol"] for w in top]
 
-            # Actualizar suscripciones WS si la lista cambió
             await self._update_subscriptions(new_symbols)
 
             with self.lock:
-                self.winners          = top
-                self.last_winners_at  = time.time()
+                self.winners         = top
+                self.last_winners_at = time.time()
 
             top_str = (f"{top[0]['symbol']} {top[0]['change']:.1f}%" if top else "ninguno")
             self.log(f"REST ganadores: {len(top)} símbolos | top={top_str}")
@@ -478,32 +484,43 @@ class TradingBot:
         Verifica condición técnica mínima usando klines 1m:
         - Retorna True si la última vela cerrada es alcista (close >= open).
         - Si no hay datos de kline aún → permite la entrada (True).
-        Ajusta esta lógica según tu estrategia.
         """
         if not self.kline_cache:
             return True
         try:
             df = self.kline_cache.get_dataframe(symbol, "1m", only_closed=True)
             if df.empty or len(df) < 2:
-                return True   # sin datos suficientes → permitir
+                return True
             last = df.iloc[-1]
-            # Condición: la última vela es alcista → buen momento para short
             return float(last["close"]) >= float(last["open"])
         except Exception:
-            return True  # error → no bloquear entrada
+            return True
+
+    # ── Cooldown helpers ──────────────────────────────────────────────────────
+
+    def _cooldown_remaining(self, symbol: str) -> float:
+        """Segundos restantes de cooldown para un símbolo. 0 si no está bloqueado."""
+        unblock_at = self.symbol_cooldown.get(symbol, 0.0)
+        remaining  = unblock_at - time.time()
+        return max(0.0, remaining)
+
+    @staticmethod
+    def _fmt_cooldown(seconds: float) -> str:
+        """Convierte segundos a string legible: '23h 45m' o '45m 10s'."""
+        s = int(seconds)
+        h = s // 3600
+        m = (s % 3600) // 60
+        sec = s % 60
+        if h > 0:
+            return f"{h}h {m:02d}m"
+        if m > 0:
+            return f"{m}m {sec:02d}s"
+        return f"{sec}s"
 
     # ── Scanner (evalúa entradas) ──────────────────────────────────────────────
 
     async def _scanner(self) -> None:
-        """
-        Cada SCAN_INTERVAL_SECS:
-          1. Lee la lista de 30 ganadores (ya actualizada por REST).
-          2. Para cada uno, obtiene precio en tiempo real del price_cache WS.
-          3. Verifica condición kline.
-          4. Aplica la estrategia de niveles y abre shorts si procede.
-        """
         self.log("Scanner: esperando datos de price_cache...")
-        # Esperar hasta que el price_cache tenga datos
         for _ in range(60):
             if not self.running:
                 return
@@ -524,22 +541,19 @@ class TradingBot:
                         continue
                     symbol = row["symbol"]
                     change = row["change"]
-                    # Precio en tiempo real (WS) o fallback al precio REST
-                    price = all_prices.get(symbol) or row.get("price", 0.0)
+                    price  = all_prices.get(symbol) or row.get("price", 0.0)
                     if price <= 0:
                         continue
 
-                    # Verificar condición kline antes de entrar
                     kline_ok = self._kline_entry_ok(symbol)
 
                     for level, notional in zip(ENTRY_LEVELS, ENTRY_NOTIONALS):
                         if change >= level and kline_ok:
                             await self._ensure_short(symbol, level, notional, price, change)
 
-                    # Revisar TP también en el scanner (respaldo)
                     await self._maybe_take_profit(symbol, price)
 
-                # También revisar TP de posiciones que ya no están en winners
+                # Revisar TP de posiciones que ya no están en winners
                 with self.lock:
                     pos_syms = list(self.positions.keys())
                 winner_syms = {w["symbol"] for w in winners}
@@ -553,11 +567,21 @@ class TradingBot:
                     self.scan_count  += 1
                     self.last_scan_at = time.time()
 
+                # Limpiar cooldowns expirados para no acumular entradas obsoletas
+                with self.lock:
+                    now = time.time()
+                    self.symbol_cooldown = {
+                        sym: ts for sym, ts in self.symbol_cooldown.items() if ts > now
+                    }
+
                 n_high = sum(1 for w in winners if w["change"] >= ENTRY_LEVELS[0])
+                with self.lock:
+                    n_cool = len(self.symbol_cooldown)
                 self.log(
                     f"Escan #{self.scan_count}: {len(winners)} ganadores | "
                     f">={ENTRY_LEVELS[0]:.0f}%: {n_high} | "
-                    f"posiciones abiertas: {len(self.positions)}"
+                    f"posiciones abiertas: {len(self.positions)} | "
+                    f"en cooldown: {n_cool}"
                 )
                 self.persist_state()
 
@@ -567,13 +591,9 @@ class TradingBot:
 
             await asyncio.sleep(SCAN_INTERVAL_SECS)
 
-    # ── Realtime TP loop (alta frecuencia, WS prices) ─────────────────────────
+    # ── Realtime TP loop ──────────────────────────────────────────────────────
 
     async def _realtime_price_loop(self) -> None:
-        """
-        Cada 0.25 s comprueba TP de posiciones abiertas usando precios WS.
-        No usa REST. Este es el loop que asegura no perder el momento de cierre.
-        """
         while self.running:
             try:
                 if self.price_cache and self.positions:
@@ -588,10 +608,9 @@ class TradingBot:
                 self.last_error = str(exc)
             await asyncio.sleep(0.25)
 
-    # ── Snapshot loop (mantiene _sse_snapshot y sirve /api/status) ─────────────
+    # ── Snapshot loop ─────────────────────────────────────────────────────────
 
     async def _snapshot_loop(self) -> None:
-        """Reconstruye el snapshot JSON cada segundo para /api/status."""
         while self.running:
             try:
                 snap = self._build_snapshot()
@@ -604,6 +623,11 @@ class TradingBot:
 
     async def _ensure_short(self, symbol: str, level: float, notional: float, price: float, change: float) -> None:
         with self.lock:
+            # ── Cooldown: no abrir si el símbolo fue cerrado recientemente ───
+            remaining = self._cooldown_remaining(symbol)
+            if remaining > 0:
+                return  # bloqueado, sin log para no saturar eventos
+            # ─────────────────────────────────────────────────────────────────
             pos = self.positions.setdefault(symbol, BotPosition(symbol=symbol))
             if level in pos.opened_levels() or pos.status != "OPEN":
                 return
@@ -613,7 +637,10 @@ class TradingBot:
             fill = Fill(level=level, notional=notional, entry_price=price, qty=qty)
             with self.lock:
                 self.positions[symbol].fills.append(fill)
-            self.log(f"SHORT {symbol}: nivel {level:.0f}% | {notional:.2f} USDT | qty={qty} | px={price:.6f} | cambio={change:.2f}%")
+            self.log(
+                f"SHORT {symbol}: nivel {level:.0f}% | {notional:.2f} USDT | "
+                f"qty={qty} | px={price:.6f} | cambio={change:.2f}%"
+            )
             self.persist_state()
         except Exception as exc:
             self.last_error = str(exc)
@@ -624,10 +651,10 @@ class TradingBot:
             pos = self.positions.get(symbol)
             if not pos or pos.status != "OPEN" or not pos.fills:
                 return
-            pnl     = pos.unrealized_pnl(price)
-            target  = pos.notional * TAKE_PROFIT_FRACTION
-            qty     = pos.qty
-            avg_ent = pos.avg_entry
+            pnl      = pos.unrealized_pnl(price)
+            target   = pos.notional * TAKE_PROFIT_FRACTION
+            qty      = pos.qty
+            avg_ent  = pos.avg_entry
             notional = pos.notional
 
         if pnl < target:
@@ -645,42 +672,61 @@ class TradingBot:
             if pos:
                 pos.status       = "CLOSED"
                 pos.realized_pnl = pnl
+
+                # ── Registrar cooldown de 24 h (configurable) ────────────────
+                unblock_ts = time.time() + COOLDOWN_SECONDS
+                self.symbol_cooldown[symbol] = unblock_ts
+                unblock_str = datetime.fromtimestamp(unblock_ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                # ─────────────────────────────────────────────────────────────
+
                 self.closed_trades.insert(0, {
-                    "symbol":      symbol,
-                    "pnl":         pnl,
-                    "target":      target,
-                    "qty":         qty,
-                    "avg_entry":   avg_ent,
-                    "close_price": price,
-                    "notional":    notional,
-                    "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "symbol":       symbol,
+                    "pnl":          pnl,
+                    "target":       target,
+                    "qty":          qty,
+                    "avg_entry":    avg_ent,
+                    "close_price":  price,
+                    "notional":     notional,
+                    "closed_at":    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "unblock_at":   unblock_str,
                 })
                 self.closed_trades = self.closed_trades[:100]
 
-        self.log(f"CIERRE {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | px={price:.6f}")
+        self.log(
+            f"CIERRE {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | px={price:.6f} | "
+            f"bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+        )
         self.persist_state()
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
     def _build_snapshot(self) -> dict:
         """Construye el snapshot completo para /api/status. Thread-safe."""
-        # Precios en tiempo real del WS cache
         all_prices = self.price_cache.get_all_prices() if self.price_cache else {}
         ws_stats   = self.price_cache.get_stats()       if self.price_cache else {}
         kl_stats   = self.kline_cache.get_stats()       if self.kline_cache else {}
 
         with self.lock:
-            winners_raw  = list(self.winners)
+            winners_raw   = list(self.winners)
             positions_raw = dict(self.positions)
-            closed       = list(self.closed_trades[:30])
-            events       = list(self.events[:50])
+            closed        = list(self.closed_trades[:30])
+            events        = list(self.events[:50])
+            cooldown_snap = dict(self.symbol_cooldown)   # copia para no mutar
 
-        # Enriquecer ganadores con precio en tiempo real del WS
+        now = time.time()
+
+        # Enriquecer ganadores con precio WS + info de cooldown
         winners_out = []
         for w in winners_raw:
-            sym   = w["symbol"]
-            price = all_prices.get(sym) or w.get("price", 0.0)
-            winners_out.append({**w, "price": price})
+            sym       = w["symbol"]
+            price     = all_prices.get(sym) or w.get("price", 0.0)
+            remaining = max(0.0, cooldown_snap.get(sym, 0.0) - now)
+            winners_out.append({
+                **w,
+                "price":              price,
+                "cooldown_remaining": remaining,                          # segundos (float)
+                "cooldown_str":       self._fmt_cooldown(remaining) if remaining > 0 else "",
+            })
 
         # Posiciones con PnL en tiempo real
         open_positions = []
@@ -692,15 +738,15 @@ class TradingBot:
             total_unreal   += pnl
             total_notional += pos.notional
             open_positions.append({
-                "symbol":        symbol,
-                "mark_price":    price,
-                "avg_entry":     pos.avg_entry,
-                "qty":           pos.qty,
-                "notional":      pos.notional,
-                "target":        pos.notional * TAKE_PROFIT_FRACTION,
+                "symbol":         symbol,
+                "mark_price":     price,
+                "avg_entry":      pos.avg_entry,
+                "qty":            pos.qty,
+                "notional":       pos.notional,
+                "target":         pos.notional * TAKE_PROFIT_FRACTION,
                 "unrealized_pnl": pnl,
-                "fills":         [f.__dict__ for f in pos.fills],
-                "change":        next((w["change"] for w in winners_raw if w["symbol"] == symbol), 0.0),
+                "fills":          [f.__dict__ for f in pos.fills],
+                "change":         next((w["change"] for w in winners_raw if w["symbol"] == symbol), 0.0),
             })
 
         last_scan_text = (
@@ -712,12 +758,22 @@ class TradingBot:
             if self.last_winners_at else "pendiente"
         )
 
+        # Cooldowns activos para el panel de diagnóstico
+        active_cooldowns = {
+            sym: {
+                "remaining_s":   round(ts - now, 0),
+                "remaining_str": self._fmt_cooldown(ts - now),
+                "unblock_utc":   datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            }
+            for sym, ts in cooldown_snap.items() if ts > now
+        }
+
         return {
             "mode":              "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL",
             "running":           self.running,
             "thread_alive":      bool(self.thread and self.thread.is_alive()),
             "started_at":        self.started_at,
-            "uptime_seconds":    round(time.time() - self.started_at, 1),
+            "uptime_seconds":    round(now - self.started_at, 1),
             "scan_count":        self.scan_count,
             "last_scan_text":    last_scan_text,
             "last_winners_text": last_winners_text,
@@ -735,17 +791,20 @@ class TradingBot:
             "winners":           winners_out,
             "closed_trades":     closed,
             "events":            events,
+            "cooldown_count":    len(active_cooldowns),
+            "cooldowns":         active_cooldowns,
+            "cooldown_hours":    COOLDOWN_SECONDS / 3600,
             "price_ws": {
-                "active":   ws_stats.get("active_symbols", 0),
-                "total":    ws_stats.get("total_symbols",  0),
-                "stale":    ws_stats.get("stale_symbols",  0),
+                "active": ws_stats.get("active_symbols", 0),
+                "total":  ws_stats.get("total_symbols",  0),
+                "stale":  ws_stats.get("stale_symbols",  0),
             },
             "kline_ws": {
                 "pairs_with_data": kl_stats.get("pairs_with_data", 0),
                 "total_messages":  kl_stats.get("total_messages",  0),
                 "active_conns":    kl_stats.get("active_connections", 0),
             },
-            "ts": time.time(),
+            "ts": now,
         }
 
     # ── Persistencia ─────────────────────────────────────────────────────────
@@ -765,7 +824,6 @@ class TradingBot:
     def snapshot(self) -> dict:
         """Snapshot público (para /api/status y carga inicial de la página)."""
         live = self._build_snapshot()
-        # Intentar usar estado persistido si no tenemos datos aún
         if not live["positions"] and not live["winners"] and os.path.exists(STATE_FILE):
             try:
                 with open(STATE_FILE, "r", encoding="utf-8") as fh:
@@ -790,7 +848,7 @@ app = Flask(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTML + JS (fetch polling — sin conexión directa a Binance desde el navegador)
+# HTML + JS
 # ─────────────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!doctype html>
@@ -804,17 +862,19 @@ HTML = r"""<!doctype html>
       --bg: #0f172a; --card: #111827; --border: #334155;
       --txt: #e2e8f0; --muted: #94a3b8;
       --green: #22c55e; --red: #ef4444; --yellow: #f59e0b;
-      --blue: #60a5fa; --purple: #a78bfa;
+      --blue: #60a5fa; --purple: #a78bfa; --orange: #fb923c;
     }
     * { box-sizing: border-box; }
-    body  { margin: 0; font-family: Arial, sans-serif; background: var(--bg); color: var(--txt); }
-    header { padding: 20px 24px; background: var(--card); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    body   { margin: 0; font-family: Arial, sans-serif; background: var(--bg); color: var(--txt); }
+    header { padding: 20px 24px; background: var(--card); border-bottom: 1px solid var(--border);
+             display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
     header h1 { margin: 0; font-size: 18px; }
-    .badge { padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; }
-    .badge-green  { background: #14532d; color: #86efac; }
-    .badge-yellow { background: #713f12; color: #fde68a; }
-    .badge-blue   { background: #1e3a5f; color: #93c5fd; }
-    main  { padding: 16px; display: grid; gap: 16px; }
+    .badge          { padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; }
+    .badge-green    { background: #14532d; color: #86efac; }
+    .badge-yellow   { background: #713f12; color: #fde68a; }
+    .badge-blue     { background: #1e3a5f; color: #93c5fd; }
+    .badge-orange   { background: #431407; color: #fdba74; }
+    main   { padding: 16px; display: grid; gap: 16px; }
     .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
     .card  { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
     .label { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
@@ -827,15 +887,27 @@ HTML = r"""<!doctype html>
     th, td { padding: 9px 12px; border-bottom: 1px solid #1f2937; text-align: right; white-space: nowrap; }
     th:first-child, td:first-child { text-align: left; }
     th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
-    pre  { background: var(--card); padding: 12px; overflow: auto; max-height: 260px; white-space: pre-wrap; font-size: 12px; margin: 0; }
-    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #1e293b; border: 1px solid #475569; font-size: 11px; margin: 1px; }
-    #sseDot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); display: inline-block; transition: background .3s; }
-    #sseDot.on { background: var(--green); }
+    pre   { background: var(--card); padding: 12px; overflow: auto; max-height: 260px;
+            white-space: pre-wrap; font-size: 12px; margin: 0; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px;
+            background: #1e293b; border: 1px solid #475569; font-size: 11px; margin: 1px; }
     .ws-row  { display: flex; gap: 8px; flex-wrap: wrap; }
-    .ws-chip { background: #1e293b; border: 1px solid var(--border); border-radius: 8px; padding: 4px 10px; font-size: 12px; }
+    .ws-chip { background: #1e293b; border: 1px solid var(--border); border-radius: 8px;
+               padding: 4px 10px; font-size: 12px; }
     #errorBox { border-color: var(--red); }
     .sym-link { color: var(--blue); text-decoration: none; font-weight: 600; }
     .sym-link:hover { text-decoration: underline; }
+    /* Cooldown badge inline en la tabla */
+    .cd-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 6px;
+      background: #431407; color: #fdba74;
+      border: 1px solid #c2410c; font-size: 11px; font-weight: 700;
+      white-space: nowrap;
+    }
+    /* Fila en cooldown: fondo tenue anaranjado */
+    tr.in-cooldown { background: rgba(251,146,60,0.07); }
+    /* Fila con posición elegible para short */
+    tr.can-trade   { background: rgba(34,197,94,0.05); }
   </style>
 </head>
 <body>
@@ -845,6 +917,7 @@ HTML = r"""<!doctype html>
   <span id="modeBadge" class="badge badge-yellow">—</span>
   <span class="badge badge-green">Precios WS en tiempo real</span>
   <span class="badge badge-blue">Sin polling REST</span>
+  <span class="badge badge-orange">Cooldown 24 h tras cierre</span>
 </header>
 <main>
 
@@ -858,6 +931,10 @@ HTML = r"""<!doctype html>
     <div class="card"><div class="label">Ganadores REST</div><div id="lastWinners" class="value sm">—</div></div>
     <div class="card"><div class="label">Contratos cargados</div><div id="contracts" class="value">—</div></div>
     <div class="card"><div class="label">Símbolos suscritos WS</div><div id="subCount" class="value">—</div></div>
+    <div class="card">
+      <div class="label">En cooldown (24 h)</div>
+      <div id="cooldownCount" class="value warn">—</div>
+    </div>
   </div>
 
   <!-- WS status -->
@@ -869,7 +946,7 @@ HTML = r"""<!doctype html>
       <div class="ws-chip">kline pares: <b id="klPairs">—</b></div>
       <div class="ws-chip">kline msgs: <b id="klMsgs">—</b></div>
       <div class="ws-chip">kline conns: <b id="klConns">—</b></div>
-      <div class="ws-chip">Actualizaciones fetch: <b id="pollCount">0</b></div>
+      <div class="ws-chip">fetch polls: <b id="pollCount">0</b></div>
     </div>
   </div>
 
@@ -877,6 +954,19 @@ HTML = r"""<!doctype html>
   <section id="errorBox" style="display:none">
     <h2 style="color:var(--red)">Error / Diagnóstico</h2>
     <pre id="lastError" style="color:var(--red)"></pre>
+  </section>
+
+  <!-- Cooldowns activos -->
+  <section id="cooldownSection" style="display:none">
+    <h2>🔒 Símbolos en cooldown — bloqueados hasta cumplir 24 h</h2>
+    <table>
+      <thead><tr>
+        <th>Símbolo</th>
+        <th>Tiempo restante</th>
+        <th>Se desbloquea (UTC)</th>
+      </tr></thead>
+      <tbody id="tbCooldown"></tbody>
+    </table>
   </section>
 
   <!-- Posiciones abiertas -->
@@ -888,19 +978,33 @@ HTML = r"""<!doctype html>
         <th>Precio WS</th><th>Notional</th><th>Objetivo</th>
         <th>PnL tiempo real</th><th>Tramos</th>
       </tr></thead>
-      <tbody id="tbPositions"><tr><td colspan="8" style="color:var(--muted)">Sin posiciones</td></tr></tbody>
+      <tbody id="tbPositions">
+        <tr><td colspan="8" style="color:var(--muted)">Sin posiciones</td></tr>
+      </tbody>
     </table>
   </section>
 
   <!-- Ganadores -->
   <section>
-    <h2>Top <span id="winnerCount">0</span> ganadores (actualizado por REST cada 60 s · precios por WS)</h2>
+    <h2>
+      Top <span id="winnerCount">0</span> ganadores
+      <span style="color:var(--muted);font-weight:400;font-size:13px">
+        · REST cada 60 s &nbsp;|&nbsp; precios por WS &nbsp;|&nbsp;
+        🟠 = cooldown activo
+      </span>
+    </h2>
     <table>
       <thead><tr>
-        <th>Símbolo</th><th>Cambio 24h</th><th>Precio WS</th>
-        <th>Condición kline</th><th>Short</th>
+        <th>Símbolo</th>
+        <th>Cambio 24h</th>
+        <th>Precio WS</th>
+        <th>Cond. kline</th>
+        <th>Short</th>
+        <th>Estado</th>
       </tr></thead>
-      <tbody id="tbWinners"><tr><td colspan="5" style="color:var(--muted)">Cargando…</td></tr></tbody>
+      <tbody id="tbWinners">
+        <tr><td colspan="6" style="color:var(--muted)">Cargando…</td></tr>
+      </tbody>
     </table>
   </section>
 
@@ -910,9 +1014,12 @@ HTML = r"""<!doctype html>
     <table>
       <thead><tr>
         <th>Símbolo</th><th>PnL realizado</th><th>Objetivo</th>
-        <th>Entrada media</th><th>Precio cierre</th><th>Fecha</th>
+        <th>Entrada media</th><th>Precio cierre</th>
+        <th>Bloqueado hasta</th><th>Fecha cierre</th>
       </tr></thead>
-      <tbody id="tbClosed"><tr><td colspan="6" style="color:var(--muted)">Sin cierres aún</td></tr></tbody>
+      <tbody id="tbClosed">
+        <tr><td colspan="7" style="color:var(--muted)">Sin cierres aún</td></tr>
+      </tbody>
     </table>
   </section>
 
@@ -925,29 +1032,68 @@ HTML = r"""<!doctype html>
 </main>
 
 <script>
-// ── Utilidades ─────────────────────────────────────────────────────────────────
+// ── Utilidades ──────────────────────────────────────────────────────────────
 const q     = id => document.getElementById(id);
 const n     = v  => { const p = Number(v); return isFinite(p) ? p : 0; };
 const fx    = (v, d=8) => n(v).toFixed(d);
 const money = v  => fx(v,4) + ' USDT';
 const pct   = v  => fx(v,2) + '%';
 const cls   = v  => n(v) >= 0 ? 'positive' : 'negative';
+
 function tb(rows, fallback, cols) {
   return rows.length
     ? rows.join('')
     : `<tr><td colspan="${cols}" style="color:var(--muted)">${fallback}</td></tr>`;
 }
 
+// Formatea segundos restantes en 'Xh YYm' o 'Ym ZZs'
+function fmtCd(secs) {
+  const s = Math.max(0, Math.floor(secs));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  if (h > 0) return `${h}h ${String(m).padStart(2,'0')}m`;
+  if (m > 0) return `${m}m ${String(r).padStart(2,'0')}s`;
+  return `${r}s`;
+}
+
 let pollCount = 0;
 const dot = q('dotPoll');
 
-// ── Render ─────────────────────────────────────────────────────────────────────
+// ── Contador regresivo local (actualiza cada segundo entre polls) ────────────
+// Para que el tiempo restante de cooldown se mueva sin esperar al fetch.
+let _cdData    = {};   // { SYMBOL: { remaining_s, unblock_utc } }
+let _lastFetch = 0;    // timestamp JS del último fetch exitoso
+
+function tickCooldowns() {
+  const elapsed = (Date.now() - _lastFetch) / 1000;
+  Object.keys(_cdData).forEach(sym => {
+    const rem = Math.max(0, _cdData[sym].remaining_s - elapsed);
+    // Actualizar badge en la tabla de ganadores
+    const el = document.getElementById('cd_' + sym);
+    if (el) {
+      if (rem > 0) { el.textContent = '🔒 ' + fmtCd(rem); }
+      else         { el.textContent = '✓ libre'; el.className = ''; el.style.color = 'var(--green)'; }
+    }
+    // Actualizar fila en la tabla de cooldowns
+    const tr = document.getElementById('cdrow_' + sym);
+    if (tr) {
+      const tdRem = tr.querySelector('.cdrem');
+      if (tdRem) tdRem.textContent = rem > 0 ? fmtCd(rem) : 'Expirado';
+    }
+  });
+}
+setInterval(tickCooldowns, 1000);
+
+// ── Render ──────────────────────────────────────────────────────────────────
 function render(d) {
   if (!d) return;
+  _lastFetch = Date.now();
+
   const mode = d.mode || '—';
-  q('mode').textContent        = mode;
-  q('modeBadge').textContent   = mode;
-  q('modeBadge').className     = 'badge ' + (mode === 'REAL' ? 'badge-green' : 'badge-yellow');
+  q('mode').textContent       = mode;
+  q('modeBadge').textContent  = mode;
+  q('modeBadge').className    = 'badge ' + (mode === 'REAL' ? 'badge-green' : 'badge-yellow');
 
   const pu = n(d.total_unrealized);
   q('pnl').textContent         = money(pu);
@@ -958,6 +1104,7 @@ function render(d) {
   q('lastWinners').textContent = d.last_winners_text || 'pendiente';
   q('contracts').textContent   = n(d.exchange_symbols);
   q('subCount').textContent    = n(d.subscribed_count);
+  q('cooldownCount').textContent = n(d.cooldown_count);
 
   const pw = d.price_ws || {}, kw = d.kline_ws || {};
   q('wsActive').textContent  = n(pw.active);
@@ -972,7 +1119,29 @@ function render(d) {
   q('errorBox').style.display = err ? 'block' : 'none';
   q('lastError').textContent  = err;
 
-  // ── Posiciones ───────────────────────────────────────────────────────────────
+  // ── Cooldowns: actualizar cache local para el countdown JS ───────────────
+  _cdData = {};
+  const cooldowns = d.cooldowns || {};
+  Object.entries(cooldowns).forEach(([sym, info]) => {
+    _cdData[sym] = { remaining_s: n(info.remaining_s), unblock_utc: info.unblock_utc || '' };
+  });
+
+  // ── Panel cooldowns ───────────────────────────────────────────────────────
+  const cdEntries = Object.entries(cooldowns);
+  q('cooldownSection').style.display = cdEntries.length ? 'block' : 'none';
+  q('tbCooldown').innerHTML = cdEntries.length
+    ? cdEntries
+        .sort((a, b) => n(b[1].remaining_s) - n(a[1].remaining_s))
+        .map(([sym, info]) => `
+          <tr id="cdrow_${sym}">
+            <td style="font-weight:700;color:var(--orange)">${sym}</td>
+            <td class="cdrem" style="color:var(--orange)">${fmtCd(n(info.remaining_s))}</td>
+            <td style="color:var(--muted)">${info.unblock_utc || ''}</td>
+          </tr>`)
+        .join('')
+    : '<tr><td colspan="3" style="color:var(--muted)">Ninguno</td></tr>';
+
+  // ── Posiciones ────────────────────────────────────────────────────────────
   const positions = Array.isArray(d.positions) ? d.positions : [];
   q('tbPositions').innerHTML = tb(positions.map(p => {
     const pnl   = n(p.unrealized_pnl);
@@ -980,7 +1149,8 @@ function render(d) {
       .map(f => `<span class="pill">+${fx(f.level,0)}% / ${fx(f.notional,2)}</span>`)
       .join(' ');
     return `<tr>
-      <td><a class="sym-link" href="https://www.binance.com/en/futures/${p.symbol}" target="_blank">${p.symbol}</a></td>
+      <td><a class="sym-link" href="https://www.binance.com/en/futures/${p.symbol}"
+             target="_blank">${p.symbol}</a></td>
       <td class="${cls(p.change)}">${pct(p.change)}</td>
       <td>${fx(p.avg_entry)}</td>
       <td>${fx(p.mark_price)}</td>
@@ -991,43 +1161,67 @@ function render(d) {
     </tr>`;
   }), 'Sin posiciones abiertas', 8);
 
-  // ── Ganadores ────────────────────────────────────────────────────────────────
+  // ── Ganadores ─────────────────────────────────────────────────────────────
   const winners     = Array.isArray(d.winners) ? d.winners : [];
   const entryLevels = Array.isArray(d.entry_levels) ? d.entry_levels : [50];
   q('winnerCount').textContent = winners.length;
+
   q('tbWinners').innerHTML = tb(winners.map(w => {
-    const change   = n(w.change);
-    const canTrade = change >= entryLevels[0];
-    return `<tr style="${canTrade ? 'background:rgba(34,197,94,0.05)' : ''}">
-      <td><a class="sym-link" href="https://www.binance.com/en/futures/${w.symbol}" target="_blank">${w.symbol}</a></td>
+    const change     = n(w.change);
+    const cdSecs     = n(w.cooldown_remaining);
+    const inCooldown = cdSecs > 0;
+    const canTrade   = change >= entryLevels[0] && !inCooldown;
+    const rowCls     = inCooldown ? 'in-cooldown' : (canTrade ? 'can-trade' : '');
+
+    // Badge de estado
+    let statusHtml;
+    if (inCooldown) {
+      statusHtml = `<span id="cd_${w.symbol}" class="cd-badge">🔒 ${fmtCd(cdSecs)}</span>`;
+      // Registrar en cache para countdown local
+      if (!_cdData[w.symbol]) {
+        _cdData[w.symbol] = { remaining_s: cdSecs, unblock_utc: w.cooldown_str || '' };
+      }
+    } else if (canTrade) {
+      statusHtml = `<span id="cd_${w.symbol}" style="color:var(--green)">✓ libre</span>`;
+    } else {
+      statusHtml = `<span id="cd_${w.symbol}" style="color:var(--muted)">—</span>`;
+    }
+
+    return `<tr class="${rowCls}">
+      <td><a class="sym-link" href="https://www.binance.com/en/futures/${w.symbol}"
+             target="_blank">${w.symbol}</a></td>
       <td class="${cls(change)}">${pct(change)}</td>
       <td>${fx(n(w.price))}</td>
-      <td>${canTrade ? '<span style="color:var(--green)">✓ alcista</span>' : '<span style="color:var(--muted)">—</span>'}</td>
-      <td>${w.can_short ? '<span style="color:var(--green)">sí</span>' : '<span style="color:var(--red)">no</span>'}</td>
+      <td>${canTrade ? '<span style="color:var(--green)">✓ alcista</span>'
+                     : '<span style="color:var(--muted)">—</span>'}</td>
+      <td>${w.can_short
+            ? '<span style="color:var(--green)">sí</span>'
+            : '<span style="color:var(--red)">no</span>'}</td>
+      <td>${statusHtml}</td>
     </tr>`;
-  }), 'No hay ganadores aún…', 5);
+  }), 'No hay ganadores aún…', 6);
 
-  // ── Cierres ──────────────────────────────────────────────────────────────────
+  // ── Cierres ───────────────────────────────────────────────────────────────
   const closed = Array.isArray(d.closed_trades) ? d.closed_trades : [];
   q('tbClosed').innerHTML = tb(closed.map(t => `<tr>
-    <td>${t.symbol || ''}</td>
+    <td style="font-weight:700">${t.symbol || ''}</td>
     <td class="positive">${money(t.pnl)}</td>
     <td>${money(t.target)}</td>
     <td>${fx(t.avg_entry)}</td>
     <td>${fx(t.close_price)}</td>
+    <td style="color:var(--orange)">${t.unblock_at || '—'}</td>
     <td style="color:var(--muted)">${t.closed_at || ''}</td>
-  </tr>`), 'Sin cierres aún', 6);
+  </tr>`), 'Sin cierres aún', 7);
 
   q('events').textContent = (Array.isArray(d.events) ? d.events : []).join('\n');
 }
 
-// ── Polling con fetch() cada 2 s ───────────────────────────────────────────────
-// No usa SSE ni WebSocket. Llama /api/status con fetch() y actualiza el DOM.
-// Funciona con CUALQUIER tipo de worker de Gunicorn (sync, gthread, gevent).
-// No genera WORKER TIMEOUT porque cada petición dura < 100 ms.
+// ── Polling fetch() cada 2 s ─────────────────────────────────────────────────
 let pollTimer   = null;
-let pollDelay   = 2000;   // ms entre llamadas
+let pollDelay   = 2000;
 let pollFailing = false;
+
+const dotEl = q('dotPoll');
 
 async function poll() {
   try {
@@ -1035,20 +1229,20 @@ async function poll() {
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     pollCount++;
-    dot.className = 'on';
-    pollDelay     = 2000;
-    pollFailing   = false;
+    dotEl.className = 'on';
+    pollDelay       = 2000;
+    pollFailing     = false;
     render(data);
   } catch (err) {
-    dot.className = '';
+    dotEl.className = '';
     if (!pollFailing) { console.warn('Poll error:', err.message); pollFailing = true; }
-    pollDelay = Math.min(pollDelay * 1.5, 15000);  // backoff suave al fallar
+    pollDelay = Math.min(pollDelay * 1.5, 15000);
   } finally {
     pollTimer = setTimeout(poll, pollDelay);
   }
 }
 
-poll();  // arranca inmediatamente
+poll();
 window.addEventListener('beforeunload', () => { if (pollTimer) clearTimeout(pollTimer); });
 </script>
 </body>
@@ -1067,10 +1261,8 @@ def index():
     return resp
 
 
-
 @app.get("/api/status")
 def api_status():
-    from flask import jsonify
     resp = jsonify(bot.snapshot())
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
@@ -1078,14 +1270,14 @@ def api_status():
 
 @app.get("/health")
 def health():
-    from flask import jsonify
     snap = bot.snapshot()
     return jsonify({
-        "ok":         True,
-        "running":    bot.running,
-        "mode":       snap["mode"],
-        "scan_count": snap["scan_count"],
-        "last_error": snap["last_error"],
+        "ok":             True,
+        "running":        bot.running,
+        "mode":           snap["mode"],
+        "scan_count":     snap["scan_count"],
+        "last_error":     snap["last_error"],
+        "cooldown_count": snap["cooldown_count"],
     })
 
 
