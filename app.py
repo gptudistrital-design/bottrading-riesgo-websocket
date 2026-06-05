@@ -75,7 +75,7 @@ LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
 
 TOP_WINNERS          = int(os.getenv("TOP_WINNERS",          "30"))
-WINNERS_REFRESH_SECS = int(os.getenv("WINNERS_REFRESH_SECS", "60"))
+WINNERS_REFRESH_SECS = int(os.getenv("WINNERS_REFRESH_SECS", "600"))
 SCAN_INTERVAL_SECS   = int(os.getenv("SCAN_INTERVAL_SECS",   "10"))
 MIN_GAIN_TO_SHOW     = float(os.getenv("MIN_GAIN_TO_SHOW",   "0"))
 COOLDOWN_SECONDS     = int(os.getenv("COOLDOWN_SECONDS",     "86400"))
@@ -385,7 +385,7 @@ class TradingBot:
         pairs = {sym: ["1m"] for sym in symbols}
         self.kline_cache = KlineWebSocketCache(
             pairs                          = pairs,
-            max_candles                    = 10,
+            max_candles                    = 1,
             include_open_candle            = True,
             backfill_on_start              = True,
             streams_per_connection         = 30,
