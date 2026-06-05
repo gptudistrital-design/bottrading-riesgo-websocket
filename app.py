@@ -334,6 +334,19 @@ class TradingBot:
                 pass
             self.kline_cache = None
 
+    def _open_position_symbols(self) -> List[str]:
+        """Símbolos con posición abierta que deben mantenerse suscritos."""
+        with self.lock:
+            return [
+                sym for sym, pos in self.positions.items()
+                if pos.status == "OPEN" and pos.fills
+            ]
+
+    def _merged_ws_symbols(self, winners: List[str]) -> List[str]:
+        """Une winners + posiciones abiertas y elimina duplicados preservando orden."""
+        forced = self._open_position_symbols()
+        return list(dict.fromkeys([*winners, *forced]))
+
     def _start_price_cache(self, symbols: List[str]) -> None:
         """Arranca (o re-arranca) el cache de precios mark para los símbolos dados."""
         self._stop_price_cache()
@@ -369,23 +382,31 @@ class TradingBot:
 
     async def _update_subscriptions(self, new_symbols: List[str]) -> None:
         """
-        Compara la lista nueva con la suscrrita.
+        Compara la lista nueva con la suscrita.
         Si hay cambios: re-suscribe price_cache y kline_cache.
+
+        Protección importante:
+        - Siempre mantiene suscritos también los símbolos con posición abierta.
+        - Así, aunque salgan del top 30, siguen recibiendo markPrice y klines.
         """
+        merged_symbols = self._merged_ws_symbols(new_symbols)
+
         old_set = set(self.subscribed_symbols)
-        new_set = set(new_symbols)
+        new_set = set(merged_symbols)
         added   = new_set - old_set
         removed = old_set - new_set
 
         if not added and not removed:
             return  # Sin cambios
 
-        self.log(f"Actualización de suscripciones: +{len(added)} síms nuevos, -{len(removed)} eliminados")
+        self.log(
+            f"Actualización de suscripciones: +{len(added)} síms nuevos, -{len(removed)} eliminados"
+        )
 
         # Reiniciar en threads para no bloquear el event loop
-        await asyncio.to_thread(self._start_price_cache, new_symbols)
-        await asyncio.to_thread(self._start_kline_cache, new_symbols)
-        self.subscribed_symbols = list(new_symbols)
+        await asyncio.to_thread(self._start_price_cache, merged_symbols)
+        await asyncio.to_thread(self._start_kline_cache, merged_symbols)
+        self.subscribed_symbols = list(merged_symbols)
 
     # ── REST: Top 30 ganadores ────────────────────────────────────────────────
 
