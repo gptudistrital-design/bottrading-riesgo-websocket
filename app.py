@@ -539,6 +539,12 @@ class TradingBot:
             self.last_symbols_refresh_at = time.time()
             self._save_symbols_to_cache(symbols)
             self.log(f"REST: {len(symbols)} símbolos cargados y guardados en caché")
+
+            if symbols:
+               with self.lock:
+                   self.price_blocked.clear()   # ← agregar esto al refrescar
+               self.log("price_blocked reseteado con el refresh de símbolos")
+             
             return True
 
         except RuntimeError as exc:
