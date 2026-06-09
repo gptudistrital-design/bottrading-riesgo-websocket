@@ -48,13 +48,13 @@ services:
 
       # ── Estrategia ─────────────────────────────────────────────────────────
       - key: TOP_WINNERS
-        value: "30"           # cuántos símbolos ganadores seguir por WS
+        value: "20"           # cuántos símbolos ganadores seguir por WS
       - key: MIN_GAIN_TO_SHOW
         value: "0"            # cambio 24h mínimo para aparecer en tabla
 
       # ── Tiempos (en segundos) ───────────────────────────────────────────────
       - key: WINNERS_REFRESH_SECS
-        value: "600"           # cada cuánto se llama REST para renovar los 30
+        value: "1200"           # cada cuánto se llama REST para renovar los 30
       - key: SCAN_INTERVAL_SECS
         value: "10"           # cada cuánto el scanner evalúa entradas
 
