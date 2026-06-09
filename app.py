@@ -97,6 +97,14 @@ API_KEY       = os.getenv("BINANCE_API_KEY",    "")
 API_SECRET    = os.getenv("BINANCE_API_SECRET", "")
 LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
+# ── Gestión de símbolos ───────────────────────────────────────────────────────
+
+# ── Gestión de símbolos ───────────────────────────────────────────────────────
+INITIAL_SYMBOLS = [
+    s.strip()
+    for s in os.getenv("INITIAL_SYMBOLS", "").split(",")
+    if s.strip()
+]
 
 # ── Gestión de símbolos ───────────────────────────────────────────────────────
 # Lista completa de símbolos: REST inicial + caché en disco + refresh cada 12 h
@@ -577,6 +585,17 @@ class TradingBot:
             self.log(
                 f"Usando exchange_filters como fallback: {len(self.all_symbols)} símbolos"
             )
+            
+            return
+        
+        # Intento 4: lista inicial fija
+        if INITIAL_SYMBOLS:
+            self.all_symbols = INITIAL_SYMBOLS.copy()
+            self.last_symbols_refresh_at = time.time()
+            self.log(
+                f"Usando lista inicial fija: {len(self.all_symbols)} símbolos"
+            )
+        
         else:
             self.log(
                 "ADVERTENCIA: No hay símbolos disponibles. "
