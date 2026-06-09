@@ -941,7 +941,8 @@ class TradingBot:
                     f">={ENTRY_LEVELS[0]:.0f}%: {n_high} | "
                     f"posiciones: {len(self.positions)} | cooldown: {n_cool}"
                 )
-                self.persist_state()
+                if self.scan_count % 30 == 0:   # persiste solo 1 vez por minuto (~30 ciclos × 2s)
+                   self.persist_state()
 
             except asyncio.CancelledError:
                 if not self.running:
