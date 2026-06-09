@@ -1258,14 +1258,17 @@ class TradingBot:
             self.log(f"No pude persistir estado: {exc}")
 
     def snapshot(self) -> dict:
-        try:
-            cached = json.loads(self._sse_snapshot)
-            if cached.get("scan_count", 0) > 0:
-                cached["state_source"] = "memory"
-                return cached
-        except Exception:
-            pass
         live = self._build_snapshot()
+        if not live["positions"] and not live["winners"] and os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as fh:
+                    persisted = json.load(fh)
+                if isinstance(persisted, dict) and \
+                   persisted.get("scan_count", 0) > live.get("scan_count", 0):
+                    persisted["state_source"] = "persisted"
+                    return persisted
+            except Exception:
+                pass
         live["state_source"] = "memory"
         return live
 
