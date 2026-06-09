@@ -449,7 +449,7 @@ class TradingBot:
             rest_retries                   = 3,
             backfill_batch_size            = 3,
             backfill_batch_delay           = 0.25,
-            safety_refresh_interval_seconds = 1200,
+            safety_refresh_interval_seconds = 1500,
         )
         self.kline_cache.start()
         self.log(f"KlineCache iniciado con {len(symbols)} símbolos (1m)")
