@@ -39,6 +39,7 @@ DIFERENCIAS vs v3
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import random
 import threading
@@ -206,6 +207,7 @@ class KlineWebSocketCache:
         self._running = False
         self._tasks:  Dict[tuple, asyncio.Future] = {}
         self._thread: Optional[threading.Thread]  = None
+        self._startup_future = None
 
         self.connection_stats: Dict[str, dict] = defaultdict(lambda: {
             "reconnects": 0, "last_error": None, "streams": [], "active": False,
@@ -291,6 +293,64 @@ class KlineWebSocketCache:
                 sorted_rows = sorted_rows[-self.max_candles:]
             buf.clear()
             buf.extend(sorted_rows)
+
+    def _register_task(self, key: tuple, task: "asyncio.Task") -> "asyncio.Task":
+        """
+        Registra una tarea para poder cancelarla durante el apagado.
+        La tarea se elimina sola del registro cuando termina.
+        """
+        self._tasks[key] = task
+
+        def _cleanup(done_task: "asyncio.Task", task_key: tuple = key) -> None:
+            self._tasks.pop(task_key, None)
+
+        task.add_done_callback(_cleanup)
+        return task
+
+    async def _shutdown_async(self) -> None:
+        """
+        Cierre limpio ejecutado dentro del loop:
+          • cancela todas las tareas activas
+          • cierra la sesión REST
+          • libera buffers y métricas
+          • ayuda al GC a soltar memoria
+        """
+        current = asyncio.current_task()
+
+        pending = [
+            task for task in asyncio.all_tasks()
+            if task is not current and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        if self._session and not self._session.closed:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+        self._session = None
+
+        with self.lock:
+            for buf in self.buffers.values():
+                buf.clear()
+            self.buffers.clear()
+
+        self.last_message_time.clear()
+        self.message_counts.clear()
+        self.clock_closes.clear()
+        self.gap_fills.clear()
+        self._ws_disconnect_time.clear()
+        self.connection_stats.clear()
+        self.stream_mapping.clear()
+        self.subscribed_streams.clear()
+        self._tasks.clear()
+
+        self._rate_limit_pause = None
+        gc.collect()
 
     # =========================================================================
     # RATE LIMITER — pausa global 429 / 418
@@ -622,8 +682,11 @@ class KlineWebSocketCache:
                             f"🔄 {gname}: reconectado tras {elapsed:.1f}s "
                             f"— rellenando gap por REST..."
                         )
-                        asyncio.ensure_future(
-                            self._fill_reconnect_gap(group_id, stream_names, disconnect_time)
+                        self._register_task(
+                            ("gapfill", group_id, int(time.time() * 1000)),
+                            asyncio.create_task(
+                                self._fill_reconnect_gap(group_id, stream_names, disconnect_time)
+                            ),
                         )
 
                     self.connection_stats[gname]["active"] = True
@@ -813,8 +876,11 @@ class KlineWebSocketCache:
                         # Hay un gap real: descargarlo
                         start_ms = expected_next_ot
                         gaps_found += 1
-                        asyncio.ensure_future(
-                            self._fetch_and_fill(symbol, interval, start_ms, label="safety")
+                        self._register_task(
+                            ("safety", symbol.upper(), interval, int(time.time() * 1000)),
+                            asyncio.create_task(
+                                self._fetch_and_fill(symbol, interval, start_ms, label="safety")
+                            ),
                         )
 
                 if gaps_found:
@@ -897,8 +963,10 @@ class KlineWebSocketCache:
                         await asyncio.sleep(1.0)
 
                     if self._running:
-                        new_task = asyncio.ensure_future(self._ws_stream(streams, gid))
-                        self._tasks[("stream", gid)] = new_task
+                        new_task = self._register_task(
+                            ("stream", gid),
+                            asyncio.create_task(self._ws_stream(streams, gid)),
+                        )
 
             except asyncio.CancelledError:
                 break
@@ -997,14 +1065,16 @@ class KlineWebSocketCache:
 
             # ── WebSocket connections ─────────────────────────────────────────
             for idx, group in enumerate(stream_groups, 1):
-                task = asyncio.ensure_future(self._ws_stream(group, idx))
-                self._tasks[("stream", idx)] = task
+                task = self._register_task(
+                    ("stream", idx),
+                    asyncio.create_task(self._ws_stream(group, idx)),
+                )
 
             # ── Tareas de mantenimiento ───────────────────────────────────────
-            asyncio.ensure_future(self._candle_close_monitor())   # siempre activo
-            asyncio.ensure_future(self._safety_refresh())          # último recurso
-            asyncio.ensure_future(self._stream_health_monitor())   # detecta WS muertos
-            asyncio.ensure_future(self._monitor_connections())     # log periódico
+            self._register_task(("maintenance", "candle_close"), asyncio.create_task(self._candle_close_monitor()))   # siempre activo
+            self._register_task(("maintenance", "safety"), asyncio.create_task(self._safety_refresh()))          # último recurso
+            self._register_task(("maintenance", "health"), asyncio.create_task(self._stream_health_monitor()))   # detecta WS muertos
+            self._register_task(("maintenance", "monitor"), asyncio.create_task(self._monitor_connections()))     # log periódico
 
             n = sum(len(ivs) for ivs in self.pairs.values())
             print(f"\n✅ KlineWebSocketCache v4 iniciado")
@@ -1017,29 +1087,46 @@ class KlineWebSocketCache:
             print(f"   • Buffer             : ventana {self.max_candles} velas/par")
             print("=" * 70 + "\n")
 
-        asyncio.run_coroutine_threadsafe(_startup(), loop)
+        self._startup_future = asyncio.run_coroutine_threadsafe(_startup(), loop)
 
     def stop(self) -> None:
         print("🛑 Deteniendo KlineWebSocketCache…")
         self._running = False
-        time.sleep(0.5)
-
-        for task in list(self._tasks.values()):
-            try:
-                task.cancel()
-            except Exception:
-                pass
-        self._tasks.clear()
-
-        if self._session and self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._session.close(), self._loop)
 
         if self._loop and self._loop.is_running():
+            shutdown = asyncio.run_coroutine_threadsafe(self._shutdown_async(), self._loop)
+            try:
+                shutdown.result(timeout=15)
+            except Exception as e:
+                print(f"⚠️  Error en apagado limpio: {e}")
+
             self._loop.call_soon_threadsafe(self._loop.stop)
 
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3.0)
 
+        self._loop = None
+        self._thread = None
+        self._startup_future = None
+
+        # Fallback: si stop() se llama sin loop activo, igual libera estado.
+        with self.lock:
+            for buf in self.buffers.values():
+                buf.clear()
+            self.buffers.clear()
+
+        self.last_message_time.clear()
+        self.message_counts.clear()
+        self.clock_closes.clear()
+        self.gap_fills.clear()
+        self._ws_disconnect_time.clear()
+        self.connection_stats.clear()
+        self.stream_mapping.clear()
+        self.subscribed_streams.clear()
+        self._tasks.clear()
+        self._rate_limit_pause = None
+
+        gc.collect()
         print("✅ KlineWebSocketCache detenido")
 
     def force_refresh(
