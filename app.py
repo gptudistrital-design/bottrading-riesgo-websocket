@@ -443,7 +443,7 @@ class TradingBot:
             pairs                          = pairs,
             max_candles                    = 1,
             include_open_candle            = True,
-            backfill_on_start              = True,
+            backfill_on_start              = False,
             streams_per_connection         = 30,
             rest_concurrency               = 5,
             rest_retries                   = 3,
