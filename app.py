@@ -98,7 +98,7 @@ API_SECRET    = os.getenv("BINANCE_API_SECRET", "")
 LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
 
-TOP_WINNERS          = int(os.getenv("TOP_WINNERS",          "30"))
+TOP_WINNERS          = int(os.getenv("TOP_WINNERS",          "20"))
 WINNERS_REFRESH_SECS = int(os.getenv("WINNERS_REFRESH_SECS", "1200"))  # 20 min — solo descubrimiento
 WS_TICKER_UPDATE_SECS = float(os.getenv("WS_TICKER_UPDATE_SECS", "5.0"))  # actualización WS del ranking
 SCAN_INTERVAL_SECS   = int(os.getenv("SCAN_INTERVAL_SECS",   "10"))
@@ -449,7 +449,7 @@ class TradingBot:
             rest_retries                   = 3,
             backfill_batch_size            = 3,
             backfill_batch_delay           = 0.25,
-            safety_refresh_interval_seconds = 600,
+            safety_refresh_interval_seconds = 1200,
         )
         self.kline_cache.start()
         self.log(f"KlineCache iniciado con {len(symbols)} símbolos (1m)")
