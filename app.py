@@ -3,55 +3,55 @@ Bot web para shortear ganadores de Binance Futures.
 
 ARQUITECTURA:
 ════════════════════════════════════════════════════════════════════════════
- 1. REST al inicio → /fapi/v1/ticker/24hr
-      Siembra los primeros TOP_WINNERS ganadores y suscribe los streams WS.
+ 1. REST inicial → /fapi/v1/exchangeInfo
+      Obtiene TODOS los símbolos USDT-M perpetuos.
+      Guarda la lista en SYMBOLS_CACHE_FILE como respaldo ante bloqueos.
+      Si el REST falla, carga desde ese caché guardado.
 
- 2. SymbolWebSocketPriceCache (WS.py) — streams permanentes suscritos:
-        @markPrice@1s  → precio mark en tiempo real (para TP y tabla)
-        @ticker        → cambio 24h, high/low, volumen (actualización continua)
+ 2. Refresh de lista completa cada SYMBOL_REFRESH_HOURS (12 h):
+      Actualiza all_symbols vía REST y regenera el caché.
+      Si Binance bloquea la IP, el caché anterior sigue siendo válido.
 
- 3. _ws_ticker_update_loop  (cada WS_TICKER_UPDATE_SECS = 5 s)
-      Lee ticker_cache de WS.py y actualiza el campo 'change' de cada
-      winner con el % 24h en tiempo real. Re-rankea la lista por cambio.
-      ► Sustituye completamente el ciclo REST de 10 min para mantener
-        el ranking fresco — el WS siempre tiene el dato más reciente.
+ 3. Ciclo de filtrado cada FILTER_CYCLE_SECS (5 min):
+      a. Suscribe TODOS los símbolos al WS (markPrice + @ticker 24h)
+      b. Espera FULL_SUBSCRIBE_WAIT_SECS (30 s) para recibir datos de ticker
+      c. Filtra: conserva solo cambio >= MIN_GAIN_FILTER (15%) O posición abierta
+      d. DESUSCRIBE el resto → reinicia WS únicamente con la lista filtrada
+      e. Actualiza self.winners con los símbolos activos
 
- 4. REST cada WINNERS_REFRESH_SECS = 20 min → /fapi/v1/ticker/24hr
-      Solo para DESCUBRIR símbolos nuevos no suscritos que emergen en
-      el top. Si no hay nuevos, el REST no modifica la lista de winners —
-      el WS la mantiene viva con datos frescos.
+ 4. _ws_ticker_update_loop (cada WS_TICKER_UPDATE_SECS = 5 s):
+      Entre ciclos de filtrado, actualiza self.winners con los datos
+      frescos del @ticker de los símbolos actualmente suscritos.
 
- 5. KlineWebSocketCache (KlineWebSocketCache_v4.py) → klines 1m
-      Confirmación técnica de entrada (vela alcista).
+ 5. KlineWebSocketCache → klines 1m para confirmación técnica de entrada.
 
- 6. Scanner (cada SCAN_INTERVAL_SECS)
-      Lee precio WS + klines + change WS, aplica niveles 50/75/100/150/200/250 %.
+ 6. Scanner (cada SCAN_INTERVAL_SECS):
+      Lee precio WS + klines + change WS, aplica niveles 50/75/100/150/200/250%.
 
- 7. Realtime TP loop (cada 0.25 s)
+ 7. Realtime TP loop (cada 0.25 s):
       Cierra posiciones cuando PnL >= objetivo usando precios WS.
 
- 8. fetch() polling → /api/status cada 2 s
-      Actualiza el DOM sin recargar. Compatible con cualquier worker.
+ 8. fetch() polling → /api/status cada 2 s. Actualiza el DOM sin recargar.
 
  9. Cooldown 24 h tras cierre ganador.
 
 FLUJO DE DATOS:
-  Startup ──► REST seed top N ──► suscribir WS (markPrice + @ticker)
+  Startup ──► REST exchangeInfo (all symbols) ──► guardar caché
                   │
                   ▼
-     _ws_ticker_update_loop (cada 5 s)
-       ├─ lee ticker_cache[@ticker] de WS.py
-       ├─ actualiza winners[*]["change"] con cambio 24h real
-       └─ re-ordena winners de mayor a menor
+     _filter_cycle_loop (cada 5 min)
+       ├─ sub ALL symbols → espera 30s → leer ticker_cache
+       ├─ filtrar: change >= 15% OR posición abierta
+       ├─ desuscribir el resto (restart WS con lista reducida)
+       └─ actualizar self.winners
 
-     REST cada 20 min (solo si hay símbolos nuevos)
-       ├─ detecta candidatos no suscritos en el top REST
-       └─ amplía suscripciones WS si los hay
+     _ws_ticker_update_loop (cada 5 s)
+       └─ mantiene self.winners actualizado entre ciclos de filtrado
 
 ROBUSTEZ:
+  - Caché de símbolos en disco: si Binance bloquea, se usan los guardados
   - asyncio.gather con return_exceptions=True
   - Supervisor (_supervised) relanza cualquier coro que muera inesperadamente
-  - _stop_*_cache con pausa de gracia para que WS limpie sus tasks
   - HTTP 418 capturado y logueado sin crashear
 ════════════════════════════════════════════════════════════════════════════
 """
@@ -89,7 +89,7 @@ from KlineWebSocketCache_v4 import KlineWebSocketCache      # noqa: E402
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
-BASE_URL      = os.getenv("BASE_URL",   "https://fapi.binance.com")
+BASE_URL      = os.getenv("BASE_URL",    "https://fapi.binance.com")
 QUOTE_ASSET   = os.getenv("QUOTE_ASSET", "USDT")
 PAPER_MODE    = os.getenv("PAPER_MODE",   "true").lower() == "true"
 LIVE_TRADING  = os.getenv("LIVE_TRADING", "false").lower() == "true"
@@ -98,9 +98,24 @@ API_SECRET    = os.getenv("BINANCE_API_SECRET", "")
 LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
 
-TOP_WINNERS          = int(os.getenv("TOP_WINNERS",          "20"))
-WINNERS_REFRESH_SECS = int(os.getenv("WINNERS_REFRESH_SECS", "1200"))  # 20 min — solo descubrimiento
-WS_TICKER_UPDATE_SECS = float(os.getenv("WS_TICKER_UPDATE_SECS", "5.0"))  # actualización WS del ranking
+# ── Gestión de símbolos ───────────────────────────────────────────────────────
+# Lista completa de símbolos: REST inicial + caché en disco + refresh cada 12 h
+SYMBOLS_CACHE_FILE   = os.getenv(
+    "SYMBOLS_CACHE_FILE",
+    os.path.join(tempfile.gettempdir(), "futures_symbols_cache.json")
+)
+SYMBOL_REFRESH_HOURS = int(os.getenv("SYMBOL_REFRESH_HOURS", "12"))
+
+# ── Ciclo de filtrado ─────────────────────────────────────────────────────────
+# Cada FILTER_CYCLE_SECS: suscribir todos → esperar ticker → filtrar → desuscribir resto
+FILTER_CYCLE_SECS        = int(os.getenv("FILTER_CYCLE_SECS",        "300"))  # 5 min
+MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "15.0"))  # >=15% para quedar suscrito
+FULL_SUBSCRIBE_WAIT_SECS = int(os.getenv("FULL_SUBSCRIBE_WAIT_SECS", "30"))   # espera ticker tras sub ALL
+
+# ── Actualización en tiempo real del ranking (entre ciclos de filtrado) ───────
+WS_TICKER_UPDATE_SECS = float(os.getenv("WS_TICKER_UPDATE_SECS", "5.0"))
+
+# ── Resto de parámetros operativos ────────────────────────────────────────────
 SCAN_INTERVAL_SECS   = int(os.getenv("SCAN_INTERVAL_SECS",   "10"))
 MIN_GAIN_TO_SHOW     = float(os.getenv("MIN_GAIN_TO_SHOW",   "0"))
 COOLDOWN_SECONDS     = int(os.getenv("COOLDOWN_SECONDS",     "86400"))
@@ -274,21 +289,26 @@ class TradingBot:
         # Cooldown: symbol → timestamp hasta el que está bloqueado
         self.symbol_cooldown: Dict[str, float] = {}
 
-        # Bloqueo permanente por precio: símbolo superó MAX_PRICE_BLOCK
+        # Bloqueo permanente por precio
         self.price_blocked: set = set()
 
-        # WS caches
+        # ── Lista completa de símbolos (cargada en init, refresh c/12h) ──
+        self.all_symbols:              List[str] = []
+        self.last_symbols_refresh_at:  float     = 0.0
+
+        # ── WS caches ─────────────────────────────────────────────────────
         self.price_cache:        Optional[SymbolWebSocketPriceCache] = None
         self.kline_cache:        Optional[KlineWebSocketCache]       = None
         self.subscribed_symbols: List[str] = []
 
-        # Métricas
+        # ── Métricas ──────────────────────────────────────────────────────
         self.running              = False
         self.scan_count           = 0
         self.last_scan_at         = 0.0
-        self.last_winners_at      = 0.0   # timestamp del último REST de descubrimiento
-        self.last_ws_ticker_at    = 0.0   # timestamp de la última actualización WS del ranking
-        self.ws_ticker_update_count = 0   # número de actualizaciones WS del ranking
+        self.filter_cycle_count   = 0           # cuántos ciclos de filtrado se han ejecutado
+        self.last_filter_cycle_at = 0.0         # timestamp del último ciclo de filtrado
+        self.last_ws_ticker_at    = 0.0         # timestamp de última actualización WS ranking
+        self.ws_ticker_update_count = 0
         self.last_error           = ""
         self.last_startup_err     = ""
         self.exchange_symbols     = 0
@@ -337,11 +357,7 @@ class TradingBot:
     # ── Supervisor ────────────────────────────────────────────────────────────
 
     async def _supervised(self, coro_factory, name: str, restart_delay: float = 2.0):
-        """
-        Envuelve una corrutina con reinicio automático.
-        Si la corrutina termina por cualquier motivo mientras self.running=True,
-        la relanza tras restart_delay segundos.
-        """
+        """Envuelve una corrutina con reinicio automático."""
         while self.running:
             try:
                 await coro_factory()
@@ -379,15 +395,16 @@ class TradingBot:
             self.last_startup_err = str(exc)
             self.log(f"ExchangeInfo falló ({exc}). Continúo con filtros mínimos.")
 
-        # Primer fetch REST: siembra winners y suscribe WS
-        await self._fetch_top_winners()
+        # Cargar lista completa de símbolos (caché en disco o REST)
+        await self._init_all_symbols()
 
         await asyncio.gather(
-            self._supervised(self._winners_refresh_loop,  "_winners_refresh_loop"),
-            self._supervised(self._ws_ticker_update_loop, "_ws_ticker_update_loop"),
-            self._supervised(self._scanner,               "_scanner"),
-            self._supervised(self._realtime_price_loop,   "_realtime_price_loop"),
-            self._supervised(self._snapshot_loop,         "_snapshot_loop"),
+            self._supervised(self._all_symbols_refresh_loop,  "_all_symbols_refresh_loop"),
+            self._supervised(self._filter_cycle_loop,          "_filter_cycle_loop"),
+            self._supervised(self._ws_ticker_update_loop,      "_ws_ticker_update_loop"),
+            self._supervised(self._scanner,                    "_scanner"),
+            self._supervised(self._realtime_price_loop,        "_realtime_price_loop"),
+            self._supervised(self._snapshot_loop,              "_snapshot_loop"),
             return_exceptions=True,
         )
 
@@ -418,11 +435,6 @@ class TradingBot:
                 if pos.status == "OPEN" and pos.fills
             ]
 
-    def _merged_ws_symbols(self, winners: List[str]) -> List[str]:
-        """Devuelve winners + posiciones abiertas (sin duplicados, sin alterar orden)."""
-        forced = self._open_position_symbols()
-        return list(dict.fromkeys([*winners, *forced]))
-
     def _start_price_cache(self, symbols: List[str]) -> None:
         self._stop_price_cache()
         if not symbols:
@@ -440,248 +452,320 @@ class TradingBot:
             return
         pairs = {sym: ["1m"] for sym in symbols}
         self.kline_cache = KlineWebSocketCache(
-            pairs                          = pairs,
-            max_candles                    = 1,
-            include_open_candle            = True,
-            backfill_on_start              = False,
-            streams_per_connection         = 30,
-            rest_concurrency               = 5,
-            rest_retries                   = 3,
-            backfill_batch_size            = 3,
-            backfill_batch_delay           = 0.25,
+            pairs                           = pairs,
+            max_candles                     = 1,
+            include_open_candle             = True,
+            backfill_on_start               = False,
+            streams_per_connection          = 30,
+            rest_concurrency                = 5,
+            rest_retries                    = 3,
+            backfill_batch_size             = 3,
+            backfill_batch_delay            = 0.25,
             safety_refresh_interval_seconds = 1500,
         )
         self.kline_cache.start()
         self.log(f"KlineCache iniciado con {len(symbols)} símbolos (1m)")
 
-    async def _update_subscriptions(self, new_symbols: List[str]) -> None:
-        """
-        Compara la lista nueva con la suscrita y re-suscribe si hay cambios.
-        Los stop/start de caches se ejecutan en un thread para no bloquear el event loop.
-        """
-        merged_symbols = self._merged_ws_symbols(new_symbols)
-        old_set = set(self.subscribed_symbols)
-        new_set = set(merged_symbols)
+    # ── Caché de símbolos en disco ─────────────────────────────────────────────
 
-        if old_set == new_set:
-            return
-
-        added   = new_set - old_set
-        removed = old_set - new_set
-        self.log(
-            f"Suscripciones WS: +{len(added)} nuevos, -{len(removed)} eliminados"
-        )
-
-        await asyncio.to_thread(self._start_price_cache, merged_symbols)
-        await asyncio.to_thread(self._start_kline_cache, merged_symbols)
-        self.subscribed_symbols = list(merged_symbols)
-
-    # ── REST: inicialización y descubrimiento de nuevos símbolos ─────────────
-
-    async def _fetch_top_winners(self) -> None:
-        """
-        Llama a /fapi/v1/ticker/24hr con dos propósitos según el momento:
-
-        ① Primera vez (startup, subscribed_symbols vacío):
-            → Siembra la lista de ganadores completa desde REST.
-            → Suscribe los streams WS (markPrice + @ticker) para esos N símbolos.
-            → A partir de aquí, _ws_ticker_update_loop actualiza 'change' en
-              tiempo real: el REST solo vuelve a correr cada 20 min.
-
-        ② Llamadas sucesivas (cada WINNERS_REFRESH_SECS = 20 min):
-            → Solo detecta símbolos de alto rendimiento NO suscritos aún.
-            → Si los hay, los añade a winners (con datos REST como semilla) y
-              amplía las suscripciones WS para que el stream @ticker los cubra.
-            → Si no hay nuevos, el REST no toca nada — WS lleva el control.
-        """
-        is_initial = not self.subscribed_symbols
-
+    def _load_symbols_from_cache(self) -> List[str]:
+        """Lee la lista de símbolos desde el archivo de caché en disco."""
         try:
-            if is_initial:
-                self.log("REST: inicializando lista de ganadores y suscripciones WS...")
-            else:
+            if not os.path.exists(SYMBOLS_CACHE_FILE):
+                return []
+            with open(SYMBOLS_CACHE_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            symbols   = data.get("symbols", [])
+            saved_at  = data.get("saved_at", 0)
+            age_hours = (time.time() - saved_at) / 3600
+            if symbols:
                 self.log(
-                    f"REST: descubrimiento de nuevos símbolos "
-                    f"(intervalo {WINNERS_REFRESH_SECS // 60} min)..."
+                    f"Caché de símbolos cargado: {len(symbols)} símbolos "
+                    f"(guardado hace {age_hours:.1f} h)"
                 )
+            return symbols if isinstance(symbols, list) else []
+        except Exception as exc:
+            self.log(f"No pude leer caché de símbolos: {exc}")
+            return []
 
-            data = await self.client.request("GET", "/fapi/v1/ticker/24hr")
-            if not isinstance(data, list):
-                self.log("REST: respuesta inesperada (no es lista)")
-                return
+    def _save_symbols_to_cache(self, symbols: List[str]) -> None:
+        """Guarda la lista de símbolos en disco para recuperación ante bloqueos."""
+        tmp = f"{SYMBOLS_CACHE_FILE}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"symbols": symbols, "saved_at": time.time()}, fh)
+            os.replace(tmp, SYMBOLS_CACHE_FILE)
+            self.log(f"Caché de símbolos guardado: {len(symbols)} símbolos → {SYMBOLS_CACHE_FILE}")
+        except Exception as exc:
+            self.log(f"No pude guardar caché de símbolos: {exc}")
 
+    # ── REST: obtención de todos los símbolos ─────────────────────────────────
+
+    async def _refresh_all_symbols(self) -> bool:
+        """
+        Obtiene todos los símbolos USDT-M perpetuos vía REST (exchangeInfo).
+        Guarda el resultado en SYMBOLS_CACHE_FILE como respaldo.
+        Devuelve True si tuvo éxito.
+        """
+        try:
+            self.log("REST: obteniendo lista completa de símbolos de futuros USDT-M...")
+            data    = await self.client.request("GET", "/fapi/v1/exchangeInfo")
             filters = self.client.exchange_filters
 
-            # ── Construir mapa completo symbol → datos REST ───────────────
-            rest_map: Dict[str, dict] = {}
-            for item in data:
-                symbol = item.get("symbol", "")
-                if not symbol.endswith(QUOTE_ASSET):
+            symbols: List[str] = []
+            for sym_info in data.get("symbols", []):
+                if sym_info.get("quoteAsset")   != QUOTE_ASSET:  continue
+                if sym_info.get("contractType") != "PERPETUAL":  continue
+                if sym_info.get("status")       != "TRADING":    continue
+                s = sym_info["symbol"]
+                # Si exchange_filters ya está cargado, usarlo como filtro extra
+                if filters and s not in filters:
                     continue
-                if filters and symbol not in filters:
-                    continue
-                try:
-                    change = float(item.get("priceChangePercent", 0.0))
-                    price  = float(item.get("lastPrice", 0.0))
-                except (TypeError, ValueError):
-                    continue
-                if price <= 0 or change < MIN_GAIN_TO_SHOW:
-                    continue
-                rest_map[symbol] = {
-                    "symbol":    symbol,
-                    "change":    change,
-                    "price":     price,
-                    "market":    "futures",
-                    "can_short": True,
-                }
+                symbols.append(s)
 
-            all_candidates = sorted(
-                rest_map.values(), key=lambda x: x["change"], reverse=True
-            )
+            if not symbols:
+                self.log("REST: respuesta vacía al obtener símbolos")
+                return False
 
-            # ── ① Startup: seed completo ──────────────────────────────────
-            if is_initial:
-                top = all_candidates[:TOP_WINNERS]
-                new_symbols = [c["symbol"] for c in top]
-
-                with self.lock:
-                    self.winners         = [dict(c) for c in top]
-                    self.last_winners_at = time.time()
-
-                await self._update_subscriptions(new_symbols)
-
-                top_str = (
-                    f"{top[0]['symbol']} {top[0]['change']:.1f}%"
-                    if top else "ninguno"
-                )
-                self.log(
-                    f"REST init: {len(top)} ganadores sembrados | top={top_str} | "
-                    f"WS @ticker actualizará el ranking cada {WS_TICKER_UPDATE_SECS:.0f}s"
-                )
-                return
-
-            # ── ② Sucesivo: solo descubrimiento ──────────────────────────
-            with self.lock:
-                subscribed_set     = set(self.subscribed_symbols)
-                existing_syms      = {w["symbol"] for w in self.winners}
-
-            # Símbolos en el top REST que no están suscritos todavía
-            top_rest_pool = all_candidates[: TOP_WINNERS * 2]  # buffer amplio
-            new_to_add    = [
-                c for c in top_rest_pool
-                if c["symbol"] not in subscribed_set
-                and c["symbol"] not in existing_syms
-            ]
-
-            if not new_to_add:
-                self.log(
-                    f"REST discovery: sin nuevos símbolos | "
-                    f"{len(subscribed_set)} ya suscritos vía WS — "
-                    f"ranking actualizado en tiempo real por @ticker"
-                )
-                with self.lock:
-                    self.last_winners_at = time.time()
-                return
-
-            self.log(
-                f"REST discovery: {len(new_to_add)} nuevos símbolos detectados: "
-                f"{[c['symbol'] for c in new_to_add[:5]]}…"
-            )
-
-            # Añadir nuevos a winners (WS @ticker los irá actualizando pronto)
-            with self.lock:
-                for c in new_to_add:
-                    self.winners.append(dict(c))
-
-                # Ordenar; respetar posiciones abiertas fuera del top N
-                self.winners.sort(key=lambda x: x["change"], reverse=True)
-                pos_syms = {
-                    sym for sym, pos in self.positions.items()
-                    if pos.status == "OPEN"
-                }
-                top_n_syms    = {w["symbol"] for w in self.winners[:TOP_WINNERS]}
-                extra_pos      = [
-                    w for w in self.winners[TOP_WINNERS:]
-                    if w["symbol"] in pos_syms
-                ]
-                self.winners         = self.winners[:TOP_WINNERS] + extra_pos
-                self.last_winners_at = time.time()
-
-            # Ampliar suscripciones WS para los nuevos símbolos
-            with self.lock:
-                all_winner_syms = [w["symbol"] for w in self.winners]
-            merged = self._merged_ws_symbols(all_winner_syms)
-            await self._update_subscriptions(merged)
-
-            with self.lock:
-                n_winners = len(self.winners)
-                top_sym   = self.winners[0]["symbol"] if self.winners else "—"
-                top_chg   = self.winners[0]["change"]  if self.winners else 0.0
-
-            self.log(
-                f"REST discovery: añadidos {len(new_to_add)} símbolos | "
-                f"winners totales: {n_winners} | top={top_sym} {top_chg:.1f}%"
-            )
+            self.all_symbols             = symbols
+            self.last_symbols_refresh_at = time.time()
+            self._save_symbols_to_cache(symbols)
+            self.log(f"REST: {len(symbols)} símbolos cargados y guardados en caché")
+            return True
 
         except RuntimeError as exc:
             msg = str(exc)
             if "418" in msg:
                 self.log(
-                    f"REST 418 (IP rate-limit Binance) — "
-                    f"esperando {WINNERS_REFRESH_SECS * 2}s"
+                    f"REST 418 (IP rate-limit Binance) al obtener símbolos — "
+                    f"usando caché si está disponible"
                 )
-                self.last_error = (
-                    f"HTTP 418 – rate-limit Binance REST. "
-                    f"Retry en {WINNERS_REFRESH_SECS * 2}s"
-                )
+                self.last_error = "HTTP 418 – rate-limit Binance REST al cargar símbolos"
             else:
                 self.last_error = msg
-                self.log(f"REST _fetch_top_winners falló: {msg}")
+                self.log(f"REST _refresh_all_symbols falló: {msg}")
+            return False
         except Exception as exc:
             self.last_error = str(exc)
-            self.log(f"REST _fetch_top_winners error: {exc}")
+            self.log(f"REST _refresh_all_symbols error: {exc}")
+            return False
 
-    async def _winners_refresh_loop(self) -> None:
+    async def _init_all_symbols(self) -> None:
         """
-        Llama a _fetch_top_winners cada WINNERS_REFRESH_SECS (20 min).
-        En llamadas sucesivas al inicio, el REST solo descubre nuevos símbolos.
-        El ranking en tiempo real corre en _ws_ticker_update_loop vía WS @ticker.
+        Carga inicial de símbolos:
+          1. Intenta leer desde caché en disco (rápido, sin REST).
+          2. Si el caché está vacío o falla, hace REST a exchangeInfo.
+          3. Si el REST también falla, usa exchange_filters como último recurso.
         """
+        # Intento 1: caché en disco
+        cached = self._load_symbols_from_cache()
+        if cached:
+            self.all_symbols             = cached
+            self.last_symbols_refresh_at = time.time()  # no forzar refresh inmediato
+            # Lanzar refresh en background para actualizar si el caché es viejo
+            asyncio.ensure_future(self._maybe_refresh_symbols_cache())
+            return
+
+        # Intento 2: REST
+        success = await self._refresh_all_symbols()
+        if success:
+            return
+
+        # Intento 3: exchange_filters (cargados al inicio desde exchangeInfo)
+        if self.client.exchange_filters:
+            self.all_symbols = list(self.client.exchange_filters.keys())
+            self.log(
+                f"Usando exchange_filters como fallback: {len(self.all_symbols)} símbolos"
+            )
+        else:
+            self.log(
+                "ADVERTENCIA: No hay símbolos disponibles. "
+                "El bot esperará hasta que se obtenga la lista."
+            )
+
+    async def _maybe_refresh_symbols_cache(self) -> None:
+        """Refresca el caché si tiene más de SYMBOL_REFRESH_HOURS horas."""
+        age = time.time() - self.last_symbols_refresh_at
+        if age > SYMBOL_REFRESH_HOURS * 3600:
+            await self._refresh_all_symbols()
+
+    async def _all_symbols_refresh_loop(self) -> None:
+        """Refresca la lista completa de símbolos cada SYMBOL_REFRESH_HOURS."""
         while self.running:
-            await asyncio.sleep(WINNERS_REFRESH_SECS)
+            await asyncio.sleep(SYMBOL_REFRESH_HOURS * 3600)
             if not self.running:
                 break
-            await self._fetch_top_winners()
+            self.log(
+                f"Refresh de símbolos programado (cada {SYMBOL_REFRESH_HOURS} h)..."
+            )
+            await self._refresh_all_symbols()
 
-    # ── WS Ticker: actualización en tiempo real del ranking ───────────────────
+    # ── Ciclo de filtrado: núcleo de la nueva arquitectura ────────────────────
+
+    async def _filter_cycle_loop(self) -> None:
+        """
+        Cada FILTER_CYCLE_SECS (5 min):
+
+          Fase 1 — Suscribir TODOS los símbolos (markPrice + @ticker).
+                   Esto incluye los que tienen posiciones abiertas.
+
+          Fase 2 — Esperar FULL_SUBSCRIBE_WAIT_SECS para recibir datos de ticker.
+
+          Fase 3 — Filtrar:
+                   • Mantiene suscritos: change >= MIN_GAIN_FILTER (15%) OR posición abierta
+                   • Descarta el resto
+
+          Fase 4 — Desuscribir el resto: reinicia WS únicamente con la lista filtrada.
+                   Reinicia también kline_cache con la lista filtrada.
+
+          Fase 5 — Actualiza self.winners con los símbolos activos.
+
+        Así ningún movimiento sorpresivo de mercado pasa desapercibido,
+        y la memoria/conexiones se usan solo para los símbolos relevantes.
+        """
+        # Esperar hasta que all_symbols esté poblado
+        for _ in range(120):
+            if not self.running:
+                return
+            if self.all_symbols:
+                break
+            await asyncio.sleep(1.0)
+
+        if not self.all_symbols:
+            self.log("[filter_cycle] No hay símbolos disponibles. Abortando ciclo.")
+            return
+
+        while self.running:
+            n_total   = len(self.all_symbols)
+            open_syms = set(self._open_position_symbols())
+
+            # Combinar all_symbols + posiciones abiertas (sin duplicados)
+            symbols_to_scan = list(dict.fromkeys([*self.all_symbols, *open_syms]))
+
+            self.log(
+                f"[filter_cycle] Ciclo #{self.filter_cycle_count + 1}: "
+                f"suscribiendo {len(symbols_to_scan)} símbolos para escaneo completo "
+                f"(posiciones abiertas: {len(open_syms)})..."
+            )
+
+            # ── Fase 1: Suscribir TODOS al WS ────────────────────────────
+            await asyncio.to_thread(self._start_price_cache, symbols_to_scan)
+
+            # ── Fase 2: Esperar datos de @ticker ─────────────────────────
+            self.log(
+                f"[filter_cycle] Esperando {FULL_SUBSCRIBE_WAIT_SECS}s "
+                f"para recibir datos de @ticker..."
+            )
+            try:
+                await asyncio.sleep(FULL_SUBSCRIBE_WAIT_SECS)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+
+            if not self.running:
+                break
+
+            # ── Fase 3: Leer tickers y filtrar ───────────────────────────
+            all_tickers: Dict[str, dict] = {}
+            try:
+                if self.price_cache:
+                    all_tickers = self.price_cache.get_all_tickers()
+            except Exception:
+                pass
+
+            # Refrescar open_syms por si cambió durante la espera
+            open_syms = set(self._open_position_symbols())
+
+            tickers_received = len(all_tickers)
+            filtered_entries: List[dict] = []
+
+            for sym in symbols_to_scan:
+                ticker  = all_tickers.get(sym)
+                in_open = sym in open_syms
+
+                change = 0.0
+                price  = 0.0
+                if ticker:
+                    change = ticker.get("change_pct", 0.0)
+                    price  = ticker.get("last_price",  0.0)
+
+                # Criterio: cambio >= umbral O posición abierta
+                if change >= MIN_GAIN_FILTER or in_open:
+                    if price > 0 or in_open:  # evitar entradas sin precio real
+                        filtered_entries.append({
+                            "symbol":    sym,
+                            "change":    change,
+                            "price":     price,
+                            "market":    "futures",
+                            "can_short": True,
+                        })
+
+            # Ordenar de mayor a menor cambio
+            filtered_entries.sort(key=lambda x: x["change"], reverse=True)
+            filtered_symbols = [e["symbol"] for e in filtered_entries]
+
+            n_filtered     = len(filtered_entries)
+            n_by_gain      = sum(1 for e in filtered_entries if e["change"] >= MIN_GAIN_FILTER)
+            n_by_pos       = len(open_syms)
+            top_info       = (
+                f"{filtered_entries[0]['symbol']} {filtered_entries[0]['change']:.1f}%"
+                if filtered_entries else "ninguno"
+            )
+
+            self.log(
+                f"[filter_cycle] {tickers_received}/{len(symbols_to_scan)} tickers | "
+                f"{n_filtered} clasificados: "
+                f">={MIN_GAIN_FILTER:.0f}%={n_by_gain}, posiciones={n_by_pos} | "
+                f"top={top_info}"
+            )
+
+            # ── Fase 4: Reiniciar WS con lista filtrada (desuscribir resto) ─
+            # Si no hay ningún símbolo (mercado plano), suscribir mínimo para no quedarse ciego
+            active_list = filtered_symbols if filtered_symbols else (
+                list(open_syms) or self.all_symbols[:10]
+            )
+
+            await asyncio.to_thread(self._start_price_cache, active_list)
+            await asyncio.to_thread(self._start_kline_cache,  active_list)
+
+            # ── Fase 5: Actualizar winners y métricas ─────────────────────
+            with self.lock:
+                self.winners              = filtered_entries
+                self.subscribed_symbols   = list(active_list)
+                self.last_filter_cycle_at = time.time()
+                self.filter_cycle_count  += 1
+
+            self.persist_state()
+
+            # ── Esperar siguiente ciclo ───────────────────────────────────
+            try:
+                await asyncio.sleep(FILTER_CYCLE_SECS)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+
+    # ── WS Ticker: actualización en tiempo real del ranking entre ciclos ──────
 
     async def _ws_ticker_update_loop(self) -> None:
         """
-        Mantiene el ranking de ganadores en tiempo real usando el stream
-        @ticker de SymbolWebSocketPriceCache (WS.py → ticker_cache).
+        Mantiene self.winners actualizado entre ciclos de filtrado.
 
-        Cada WS_TICKER_UPDATE_SECS segundos:
-          1. Lee get_all_tickers() del price_cache (thread-safe).
-          2. Actualiza winners[*]["change"] con el % 24h fresco del WS.
-          3. Re-ordena winners de mayor a menor cambio.
-
-        Reemplaza el ciclo REST de 10 min para mantener el ranking activo.
-        Aprovecha que los streams @ticker ya están suscritos indefinidamente
-        y actualizan su caché continuamente, sin coste adicional de red.
+        Cada WS_TICKER_UPDATE_SECS segundos lee get_all_tickers() del
+        price_cache (que solo cubre los símbolos actualmente suscritos)
+        y actualiza el campo 'change' de cada winner.
         """
         self.log(
             f"[ws_ticker] Loop de ranking en tiempo real iniciado "
             f"(intervalo={WS_TICKER_UPDATE_SECS:.0f}s)"
         )
 
-        # Esperar hasta que WS tenga sus primeros datos de ticker
+        # Esperar hasta que el WS tenga sus primeros datos
         for _ in range(60):
             if not self.running:
                 return
             try:
-                if self.price_cache:
-                    if self.price_cache.get_all_tickers():
-                        break
+                if self.price_cache and self.price_cache.get_all_tickers():
+                    break
             except Exception:
                 pass
             await asyncio.sleep(1.0)
@@ -689,7 +773,6 @@ class TradingBot:
         while self.running:
             try:
                 if self.price_cache:
-                    # get_all_tickers() usa su propio lock internamente → thread-safe
                     all_tickers: Dict[str, dict] = {}
                     try:
                         all_tickers = self.price_cache.get_all_tickers()
@@ -704,22 +787,18 @@ class TradingBot:
                                 sym    = w["symbol"]
                                 ticker = all_tickers.get(sym)
                                 if ticker:
-                                    # Crear nuevo dict (nunca mutar in-place) para
-                                    # evitar condiciones de carrera con lecturas externas
-                                    new_w = dict(w)
-                                    new_w["change"] = ticker["change_pct"]
+                                    new_w            = dict(w)
+                                    new_w["change"]  = ticker["change_pct"]
+                                    new_w["price"]   = ticker.get("last_price", w.get("price", 0.0))
                                     new_winners.append(new_w)
                                     ws_updated += 1
                                 else:
-                                    # Sin datos WS aún para este símbolo → conservar
                                     new_winners.append(dict(w))
 
                             if ws_updated:
-                                new_winners.sort(
-                                    key=lambda x: x["change"], reverse=True
-                                )
-                                self.winners            = new_winners
-                                self.last_ws_ticker_at  = time.time()
+                                new_winners.sort(key=lambda x: x["change"], reverse=True)
+                                self.winners              = new_winners
+                                self.last_ws_ticker_at    = time.time()
                                 self.ws_ticker_update_count += 1
 
             except asyncio.CancelledError:
@@ -774,7 +853,7 @@ class TradingBot:
         _ws_ticker_update_loop vía WS @ticker en tiempo real).
         """
         self.log("Scanner: esperando datos de price_cache...")
-        for _ in range(60):
+        for _ in range(120):
             if not self.running:
                 return
             try:
@@ -787,7 +866,6 @@ class TradingBot:
 
         while self.running:
             try:
-                # Snapshot de winners (dicts independientes para evitar race)
                 with self.lock:
                     winners = [dict(w) for w in self.winners]
 
@@ -801,7 +879,7 @@ class TradingBot:
                     if not row.get("can_short", True):
                         continue
                     symbol = row["symbol"]
-                    change = row["change"]        # actualizado por WS @ticker en tiempo real
+                    change = row["change"]
                     price  = all_prices.get(symbol) or row.get("price", 0.0)
                     if price <= 0:
                         continue
@@ -818,7 +896,7 @@ class TradingBot:
 
                     await self._maybe_take_profit(symbol, price)
 
-                # TP de posiciones fuera de winners
+                # TP de posiciones que ya no están en winners
                 with self.lock:
                     pos_syms = list(self.positions.keys())
                 winner_syms = {w["symbol"] for w in winners}
@@ -840,7 +918,7 @@ class TradingBot:
 
                 n_high = sum(1 for w in winners if w["change"] >= ENTRY_LEVELS[0])
                 self.log(
-                    f"Escan #{self.scan_count}: {len(winners)} winners (WS change) | "
+                    f"Escan #{self.scan_count}: {len(winners)} activos | "
                     f">={ENTRY_LEVELS[0]:.0f}%: {n_high} | "
                     f"posiciones: {len(self.positions)} | cooldown: {n_cool}"
                 )
@@ -1018,6 +1096,9 @@ class TradingBot:
             price_blocked_snap = set(self.price_blocked)
             last_ws_ticker_at  = self.last_ws_ticker_at
             ws_ticker_updates  = self.ws_ticker_update_count
+            filter_cycle_count = self.filter_cycle_count
+            last_filter_at     = self.last_filter_cycle_at
+            all_symbols_count  = len(self.all_symbols)
 
         now = time.time()
 
@@ -1072,15 +1153,20 @@ class TradingBot:
             .strftime("%Y-%m-%d %H:%M:%S UTC")
             if self.last_scan_at else "pendiente"
         )
-        last_winners_text = (
-            datetime.fromtimestamp(self.last_winners_at, timezone.utc)
+        last_filter_text = (
+            datetime.fromtimestamp(last_filter_at, timezone.utc)
             .strftime("%H:%M:%S UTC")
-            if self.last_winners_at else "pendiente"
+            if last_filter_at else "pendiente"
         )
         last_ws_ticker_text = (
             datetime.fromtimestamp(last_ws_ticker_at, timezone.utc)
             .strftime("%H:%M:%S UTC")
             if last_ws_ticker_at else "pendiente"
+        )
+        next_filter_text = (
+            self._fmt_cooldown(FILTER_CYCLE_SECS - (now - last_filter_at))
+            if last_filter_at and (now - last_filter_at) < FILTER_CYCLE_SECS
+            else "pronto"
         )
 
         return {
@@ -1091,14 +1177,24 @@ class TradingBot:
             "uptime_seconds":    round(now - self.started_at, 1),
             "scan_count":        self.scan_count,
             "last_scan_text":    last_scan_text,
-            "last_winners_text": last_winners_text,       # último REST discovery
-            "last_ws_ticker_text": last_ws_ticker_text,  # última actualización WS del ranking
-            "ws_ticker_updates": ws_ticker_updates,       # nº total de updates WS
+            # Ciclo de filtrado
+            "filter_cycle_count":   filter_cycle_count,
+            "last_filter_text":     last_filter_text,
+            "next_filter_text":     next_filter_text,
+            "filter_cycle_secs":    FILTER_CYCLE_SECS,
+            "min_gain_filter":      MIN_GAIN_FILTER,
+            "full_subscribe_wait":  FULL_SUBSCRIBE_WAIT_SECS,
+            # Símbolos
+            "all_symbols_count":    all_symbols_count,
+            "subscribed_count":     len(self.subscribed_symbols),
+            "subscribed_symbols":   self.subscribed_symbols,
+            # WS ticker (actualizaciones entre ciclos)
+            "last_ws_ticker_text":  last_ws_ticker_text,
+            "ws_ticker_updates":    ws_ticker_updates,
+            # Resto
             "last_error":        self.last_error,
             "last_startup_err":  self.last_startup_err,
             "exchange_symbols":  self.exchange_symbols,
-            "subscribed_count":  len(self.subscribed_symbols),
-            "subscribed_symbols": self.subscribed_symbols,
             "entry_levels":      ENTRY_LEVELS,
             "entry_notionals":   ENTRY_NOTIONALS,
             "take_profit_pct":   TAKE_PROFIT_FRACTION * 100,
@@ -1115,8 +1211,8 @@ class TradingBot:
             "price_blocked_count": len(price_blocked_snap),
             "max_price_block":   MAX_PRICE_BLOCK,
             "price_ws": {
-                "active_prices":  ws_stats.get("active_prices",  0),   # markPrice activos
-                "active_tickers": ws_stats.get("active_tickers", 0),   # @ticker activos
+                "active_prices":  ws_stats.get("active_prices",  0),
+                "active_tickers": ws_stats.get("active_tickers", 0),
                 "total":          ws_stats.get("total_symbols",  0),
                 "stale":          ws_stats.get("stale_symbols",  0),
             },
@@ -1197,6 +1293,7 @@ HTML = r"""<!doctype html>
     .badge-blue   { background: #1e3a5f; color: #93c5fd; }
     .badge-teal   { background: #134e4a; color: #99f6e4; }
     .badge-orange { background: #431407; color: #fdba74; }
+    .badge-purple { background: #3b0764; color: #d8b4fe; }
     main   { padding: 16px; display: grid; gap: 16px; }
     .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
     .card  { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
@@ -1204,7 +1301,7 @@ HTML = r"""<!doctype html>
     .value { font-size: 22px; font-weight: 700; }
     .value.sm { font-size: 14px; }
     .positive { color: var(--green); } .negative { color: var(--red); } .warn { color: var(--yellow); }
-    .teal { color: var(--teal); }
+    .teal { color: var(--teal); } .purple { color: var(--purple); }
     section { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
     section h2 { margin: 0; padding: 12px 16px; font-size: 15px; border-bottom: 1px solid var(--border); }
     table  { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -1219,6 +1316,7 @@ HTML = r"""<!doctype html>
     .ws-chip { background: #1e293b; border: 1px solid var(--border);
                border-radius: 8px; padding: 4px 10px; font-size: 12px; }
     .ws-chip.highlight { border-color: var(--teal); }
+    .ws-chip.highlight2 { border-color: var(--purple); }
     #errorBox { border-color: var(--red); }
     .sym-link { color: var(--blue); text-decoration: none; font-weight: 600; }
     .sym-link:hover { text-decoration: underline; }
@@ -1230,21 +1328,31 @@ HTML = r"""<!doctype html>
     #dotPoll { width: 8px; height: 8px; border-radius: 50%; background: var(--red);
                display: inline-block; transition: background .3s; }
     #dotPoll.on { background: var(--green); }
+    #dotFilter { width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
+                 display: inline-block; transition: background .3s; }
+    #dotFilter.on { background: var(--purple); }
     #dotWsTicker { width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
                    display: inline-block; transition: background .3s; }
     #dotWsTicker.on { background: var(--teal); }
+    .filter-bar { background: #1e293b; border: 1px solid var(--purple);
+                  border-radius: 8px; padding: 8px 14px; margin-bottom: 8px;
+                  display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; }
+    .filter-bar span { color: var(--muted); }
+    .filter-bar b   { color: var(--purple); }
   </style>
 </head>
 <body>
 <header>
-  <span id="dotPoll" title="Verde = polling REST activo"></span>
+  <span id="dotPoll"     title="Verde = polling REST activo"></span>
+  <span id="dotFilter"   title="Púrpura = ciclo de filtrado completado"></span>
   <span id="dotWsTicker" title="Teal = ranking WS @ticker activo"></span>
   <h1>Bot Short Ganadores · Binance USDT-M Futures</h1>
   <span id="modeBadge" class="badge badge-yellow">—</span>
   <span class="badge badge-green">markPrice WS en tiempo real</span>
-  <span class="badge badge-teal">Ranking 24h por WS @ticker</span>
-  <span class="badge badge-blue">REST cada 20 min (solo descubrimiento)</span>
-  <span class="badge badge-orange">Cooldown 24 h tras cierre</span>
+  <span class="badge badge-teal">Ranking 24h WS @ticker</span>
+  <span class="badge badge-purple">Ciclo filtrado cada 5 min (sub ALL → ≥15% → unsub resto)</span>
+  <span class="badge badge-blue">Lista símbolos REST inicial + caché 12h</span>
+  <span class="badge badge-orange">Cooldown 24h tras cierre</span>
 </header>
 <main>
 
@@ -1256,31 +1364,48 @@ HTML = r"""<!doctype html>
     <div class="card"><div class="label">Último escaneo</div><div id="scan" class="value sm">—</div></div>
     <div class="card"><div class="label">Escaneos totales</div><div id="scanCount" class="value">—</div></div>
     <div class="card">
-      <div class="label">Último update WS @ticker</div>
+      <div class="label">Ciclos de filtrado</div>
+      <div id="filterCycles" class="value purple">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Último ciclo filtrado</div>
+      <div id="lastFilter" class="value sm purple">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Próximo ciclo</div>
+      <div id="nextFilter" class="value sm warn">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Símbolos totales (caché)</div>
+      <div id="allSymbols" class="value">—</div>
+    </div>
+    <div class="card"><div class="label">Suscritos actualmente</div><div id="subCount" class="value teal">—</div></div>
+    <div class="card">
+      <div class="label">Update WS @ticker</div>
       <div id="lastWsTicker" class="value sm teal">—</div>
     </div>
     <div class="card">
-      <div class="label">Updates WS @ticker</div>
-      <div id="wsTickerUpdates" class="value teal">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Último REST descubrimiento</div>
-      <div id="lastWinners" class="value sm">—</div>
-    </div>
-    <div class="card"><div class="label">Contratos cargados</div><div id="contracts" class="value">—</div></div>
-    <div class="card"><div class="label">Símbolos suscritos WS</div><div id="subCount" class="value">—</div></div>
-    <div class="card">
-      <div class="label">En cooldown (24 h)</div>
+      <div class="label">En cooldown (24h)</div>
       <div id="cooldownCount" class="value warn">—</div>
     </div>
+  </div>
+
+  <!-- Estado del ciclo de filtrado -->
+  <div class="card filter-bar">
+    <div>🔍 Filtrado: sub <b id="fbAll">—</b> símbolos →
+         espera <b id="fbWait">—</b>s →
+         quedan <b id="fbFiltered">—</b> (≥<b id="fbThreshold">—</b>% o posición abierta) →
+         unsub <b id="fbUnsub">—</b></div>
+    <div>⏱ Próximo: <b id="fbNext" style="color:var(--yellow)">—</b></div>
   </div>
 
   <!-- WS status -->
   <div class="card">
     <div class="label">Estado WebSockets</div>
     <div class="ws-row" style="margin-top:8px">
-      <div class="ws-chip highlight">@ticker 24h: <b id="wsTickers" style="color:var(--teal)">—</b>/<span id="wsTotal">—</span></div>
-      <div class="ws-chip">markPrice WS: <b id="wsActive">—</b>/<span id="wsTotal2">—</span></div>
+      <div class="ws-chip highlight2">Ciclos filtrado: <b id="wsFilterCycles" style="color:var(--purple)">—</b></div>
+      <div class="ws-chip highlight">@ticker 24h activos: <b id="wsTickers" style="color:var(--teal)">—</b>/<span id="wsTotal">—</span></div>
+      <div class="ws-chip">markPrice activos: <b id="wsActive">—</b>/<span id="wsTotal2">—</span></div>
       <div class="ws-chip">stale: <b id="wsStale">—</b></div>
       <div class="ws-chip">kline pares: <b id="klPairs">—</b></div>
       <div class="ws-chip">kline msgs: <b id="klMsgs">—</b></div>
@@ -1297,7 +1422,7 @@ HTML = r"""<!doctype html>
 
   <!-- Cooldowns activos -->
   <section id="cooldownSection" style="display:none">
-    <h2>🔒 Símbolos en cooldown — bloqueados 24 h tras cierre</h2>
+    <h2>🔒 Símbolos en cooldown — bloqueados 24h tras cierre</h2>
     <table>
       <thead><tr>
         <th>Símbolo</th>
@@ -1326,10 +1451,10 @@ HTML = r"""<!doctype html>
   <!-- Ganadores -->
   <section>
     <h2>
-      Top <span id="winnerCount">0</span> ganadores
+      <span id="winnerCount">0</span> símbolos activos (≥<span id="gainThreshold">15</span>% · 24h WS)
       <span style="color:var(--muted);font-weight:400;font-size:13px">
-        · Ranking 24h en tiempo real por WS @ticker &nbsp;|&nbsp;
-        REST cada 20 min (solo nuevos símbolos) &nbsp;|&nbsp; 🟠 = cooldown
+        · Filtrado cada 5 min: sub ALL → mantener ≥15% o posición abierta
+        &nbsp;|&nbsp; 🟠 = cooldown
       </span>
     </h2>
     <table>
@@ -1342,7 +1467,7 @@ HTML = r"""<!doctype html>
         <th>Estado</th>
       </tr></thead>
       <tbody id="tbWinners">
-        <tr><td colspan="6" style="color:var(--muted)">Cargando…</td></tr>
+        <tr><td colspan="6" style="color:var(--muted)">Esperando primer ciclo de filtrado…</td></tr>
       </tbody>
     </table>
   </section>
@@ -1395,14 +1520,19 @@ function fmtCd(secs) {
   return `${r}s`;
 }
 
-let pollCount  = 0;
-let _cdData    = {};
-let _lastFetch = 0;
+let pollCount     = 0;
+let _cdData       = {};
+let _lastFetch    = 0;
+let _prevFilter   = 0;
 let _prevWsTicker = 0;
+let _filterAt     = 0;
+let _filterCycle  = 300;
 
-// Decrementa el contador de cooldown en el DOM cada segundo
-function tickCooldowns() {
+// Decrementa cooldowns y cuenta regresiva del ciclo de filtrado
+function tickTimers() {
   const elapsed = (Date.now() - _lastFetch) / 1000;
+
+  // Cooldowns
   Object.entries(_cdData).forEach(([sym, info]) => {
     const rem = Math.max(0, info.remaining_s - elapsed);
     const elBadge = document.getElementById('cd_' + sym);
@@ -1422,13 +1552,22 @@ function tickCooldowns() {
       if (tdRem) tdRem.textContent = rem > 0 ? fmtCd(rem) : 'Expirado';
     }
   });
+
+  // Cuenta regresiva del próximo ciclo de filtrado
+  if (_filterAt > 0) {
+    const nextIn = Math.max(0, _filterCycle - elapsed);
+    q('nextFilter').textContent = nextIn > 0 ? `en ${fmtCd(nextIn)}` : 'pronto…';
+    q('fbNext').textContent     = nextIn > 0 ? fmtCd(nextIn) : 'pronto…';
+  }
 }
-setInterval(tickCooldowns, 1000);
+setInterval(tickTimers, 1000);
 
 // ── Render ──────────────────────────────────────────────────────────────────
 function render(d) {
   if (!d) return;
-  _lastFetch = Date.now();
+  _lastFetch    = Date.now();
+  _filterAt     = n(d.last_filter_cycle_at || 0);  // no viene en snapshot directamente, usamos texto
+  _filterCycle  = n(d.filter_cycle_secs || 300);
 
   const mode = d.mode || '—';
   q('mode').textContent      = mode;
@@ -1436,19 +1575,40 @@ function render(d) {
   q('modeBadge').className   = 'badge ' + (mode === 'REAL' ? 'badge-green' : 'badge-yellow');
 
   const pu = n(d.total_unrealized);
-  q('pnl').textContent         = money(pu);
-  q('pnl').className           = 'value ' + cls(pu);
-  q('notional').textContent    = money(d.total_notional);
-  q('scan').textContent        = d.last_scan_text         || 'pendiente';
-  q('scanCount').textContent   = n(d.scan_count);
-  q('lastWsTicker').textContent = d.last_ws_ticker_text   || 'pendiente';
-  q('wsTickerUpdates').textContent = n(d.ws_ticker_updates);
-  q('lastWinners').textContent = d.last_winners_text      || 'pendiente';
-  q('contracts').textContent   = n(d.exchange_symbols);
-  q('subCount').textContent    = n(d.subscribed_count);
-  q('cooldownCount').textContent = n(d.cooldown_count);
+  q('pnl').textContent            = money(pu);
+  q('pnl').className              = 'value ' + cls(pu);
+  q('notional').textContent       = money(d.total_notional);
+  q('scan').textContent           = d.last_scan_text         || 'pendiente';
+  q('scanCount').textContent      = n(d.scan_count);
+  q('filterCycles').textContent   = n(d.filter_cycle_count);
+  q('lastFilter').textContent     = d.last_filter_text       || 'pendiente';
+  q('nextFilter').textContent     = d.next_filter_text       || '—';
+  q('allSymbols').textContent     = n(d.all_symbols_count);
+  q('subCount').textContent       = n(d.subscribed_count);
+  q('lastWsTicker').textContent   = d.last_ws_ticker_text    || 'pendiente';
+  q('cooldownCount').textContent  = n(d.cooldown_count);
 
-  // Parpadeo del indicador WS @ticker
+  // Filter bar info
+  const subCount  = n(d.subscribed_count);
+  const allCount  = n(d.all_symbols_count);
+  const threshold = n(d.min_gain_filter || 15);
+  q('fbAll').textContent       = allCount;
+  q('fbWait').textContent      = n(d.full_subscribe_wait || 30);
+  q('fbFiltered').textContent  = subCount;
+  q('fbThreshold').textContent = threshold;
+  q('fbUnsub').textContent     = Math.max(0, allCount - subCount);
+  q('gainThreshold').textContent = threshold;
+  q('fbNext').textContent      = d.next_filter_text || '—';
+
+  // Parpadeo del ciclo de filtrado
+  const fc = n(d.filter_cycle_count);
+  if (fc !== _prevFilter) {
+    q('dotFilter').className = 'on';
+    setTimeout(() => { q('dotFilter').className = ''; }, 1500);
+    _prevFilter = fc;
+  }
+
+  // Parpadeo del WS @ticker
   const wtu = n(d.ws_ticker_updates);
   if (wtu !== _prevWsTicker) {
     q('dotWsTicker').className = 'on';
@@ -1457,6 +1617,7 @@ function render(d) {
   }
 
   const pw = d.price_ws || {}, kw = d.kline_ws || {};
+  q('wsFilterCycles').textContent = n(d.filter_cycle_count);
   q('wsTickers').textContent  = n(pw.active_tickers);
   q('wsTotal').textContent    = n(pw.total);
   q('wsActive').textContent   = n(pw.active_prices);
@@ -1511,7 +1672,7 @@ function render(d) {
     </tr>`;
   }), 'Sin posiciones abiertas', 8);
 
-  // ── Ganadores ─────────────────────────────────────────────────────────────
+  // ── Ganadores (símbolos activos ≥15%) ────────────────────────────────────
   const winners     = Array.isArray(d.winners) ? d.winners : [];
   const entryLevels = Array.isArray(d.entry_levels) ? d.entry_levels : [50];
   q('winnerCount').textContent = winners.length;
@@ -1551,7 +1712,7 @@ function render(d) {
             : '<span style="color:var(--red)">no</span>'}</td>
       <td>${statusHtml}</td>
     </tr>`;
-  }), 'No hay ganadores aún…', 6);
+  }), 'Esperando primer ciclo de filtrado…', 6);
 
   // ── Cierres ───────────────────────────────────────────────────────────────
   const closed = Array.isArray(d.closed_trades) ? d.closed_trades : [];
@@ -1622,13 +1783,15 @@ def api_status():
 def health():
     snap = bot.snapshot()
     return jsonify({
-        "ok":                 True,
-        "running":            bot.running,
-        "mode":               snap["mode"],
-        "scan_count":         snap["scan_count"],
-        "ws_ticker_updates":  snap["ws_ticker_updates"],
-        "last_error":         snap["last_error"],
-        "cooldown_count":     snap["cooldown_count"],
+        "ok":                  True,
+        "running":             bot.running,
+        "mode":                snap["mode"],
+        "scan_count":          snap["scan_count"],
+        "filter_cycle_count":  snap["filter_cycle_count"],
+        "all_symbols_count":   snap["all_symbols_count"],
+        "subscribed_count":    snap["subscribed_count"],
+        "last_error":          snap["last_error"],
+        "cooldown_count":      snap["cooldown_count"],
     })
 
 
