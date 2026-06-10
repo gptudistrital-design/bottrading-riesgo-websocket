@@ -1012,6 +1012,8 @@ class TradingBot:
 
     async def _ensure_short(self, symbol: str, level: float, notional: float,
                              price: float, change: float) -> None:
+
+        should_log = False
         with self.lock:
             if price > MAX_PRICE_BLOCK:
                 if symbol not in self.price_blocked:
@@ -1028,6 +1030,7 @@ class TradingBot:
         try:
             if should_log:
                self.log(f"BLOQUEADO permanente {symbol}: precio {price:.4f} > {MAX_PRICE_BLOCK} USD")
+               should_log = False
             qty  = await self.client.market_short(symbol, notional, price)
             fill = Fill(level=level, notional=notional, entry_price=price, qty=qty)
             with self.lock:
