@@ -1016,10 +1016,7 @@ class TradingBot:
             if price > MAX_PRICE_BLOCK:
                 if symbol not in self.price_blocked:
                     self.price_blocked.add(symbol)
-                    self.log(
-                        f"BLOQUEADO permanente {symbol}: precio {price:.4f} > "
-                        f"{MAX_PRICE_BLOCK} USD"
-                    )
+                    should_log = True
                 return
 
             if self._cooldown_remaining(symbol) > 0:
@@ -1029,6 +1026,8 @@ class TradingBot:
                 return
 
         try:
+            if should_log:
+               self.log(f"BLOQUEADO permanente {symbol}: precio {price:.4f} > {MAX_PRICE_BLOCK} USD")
             qty  = await self.client.market_short(symbol, notional, price)
             fill = Fill(level=level, notional=notional, entry_price=price, qty=qty)
             with self.lock:
