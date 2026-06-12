@@ -581,48 +581,37 @@ class TradingBot:
             return False
 
     async def _init_all_symbols(self) -> None:
-        """
-        Carga inicial de símbolos:
-          1. Intenta leer desde caché en disco (rápido, sin REST).
-          2. Si el caché está vacío o falla, hace REST a exchangeInfo.
-          3. Si el REST también falla, usa exchange_filters como último recurso.
-        """
-        # Intento 1: caché en disco
-        cached = self._load_symbols_from_cache()
-        if cached:
-            self.all_symbols             = cached
-            self.last_symbols_refresh_at = time.time()  # no forzar refresh inmediato
-            # Lanzar refresh en background para actualizar si el caché es viejo
-            asyncio.ensure_future(self._maybe_refresh_symbols_cache())
-            return
-
-        # Intento 2: REST
-        success = await self._refresh_all_symbols()
-        if success:
-            return
-
-        # Intento 3: lista inicial fija
-        if INITIAL_SYMBOLS:
-            self.all_symbols = INITIAL_SYMBOLS.copy()
-            self.last_symbols_refresh_at = time.time()
-            self.log(
-                f"Usando lista inicial fija: {len(self.all_symbols)} símbolos"
-            )
-
-        # Intento 4: exchange_filters (cargados al inicio desde exchangeInfo)
-        if self.client.exchange_filters:
-            self.all_symbols = list(self.client.exchange_filters.keys())
-            self.log(
-                f"Usando exchange_filters como fallback: {len(self.all_symbols)} símbolos"
-            )
-            
-            return        
-        else:
-            self.log(
-                "ADVERTENCIA: No hay símbolos disponibles. "
-                "El bot esperará hasta que se obtenga la lista."
-            )
-
+          # Intento 1: caché en disco
+          cached = self._load_symbols_from_cache()
+          if cached:
+              self.all_symbols             = cached
+              self.last_symbols_refresh_at = time.time()
+              asyncio.ensure_future(self._maybe_refresh_symbols_cache())
+              return
+      
+          # Intento 2: REST
+          success = await self._refresh_all_symbols()
+          if success:
+              return
+      
+          # Intento 3: lista inicial fija 
+          if INITIAL_SYMBOLS:
+              self.all_symbols             = INITIAL_SYMBOLS.copy()
+              self.last_symbols_refresh_at = time.time()
+              self.log(f"Usando lista inicial fija: {len(self.all_symbols)} símbolos")
+              return        
+          # Intento 4: exchange_filters como último recurso
+          if self.client.exchange_filters:
+              self.all_symbols             = list(self.client.exchange_filters.keys())
+              self.last_symbols_refresh_at = time.time()
+              self.log(f"Usando exchange_filters como fallback: {len(self.all_symbols)} símbolos")
+              return
+      
+          self.log(
+              "ADVERTENCIA: No hay símbolos disponibles. "
+              "El bot esperará hasta que se obtenga la lista."
+          )
+     
     async def _maybe_refresh_symbols_cache(self) -> None:
         """Refresca el caché si tiene más de SYMBOL_REFRESH_HOURS horas."""
         age = time.time() - self.last_symbols_refresh_at
