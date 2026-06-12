@@ -117,7 +117,7 @@ SYMBOL_REFRESH_HOURS = int(os.getenv("SYMBOL_REFRESH_HOURS", "12"))
 # ── Ciclo de filtrado ─────────────────────────────────────────────────────────
 # Cada FILTER_CYCLE_SECS: suscribir todos → esperar ticker → filtrar → desuscribir resto
 FILTER_CYCLE_SECS        = int(os.getenv("FILTER_CYCLE_SECS",        "300"))  # 5 min
-MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "40.0"))  # >=15% para quedar suscrito
+MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "15.0"))  # >=15% para quedar suscrito
 FULL_SUBSCRIBE_WAIT_SECS = int(os.getenv("FULL_SUBSCRIBE_WAIT_SECS", "30"))   # espera ticker tras sub ALL
 
 # ── Actualización en tiempo real del ranking (entre ciclos de filtrado) ───────
@@ -125,7 +125,6 @@ WS_TICKER_UPDATE_SECS = float(os.getenv("WS_TICKER_UPDATE_SECS", "5.0"))
 
 # ── Resto de parámetros operativos ────────────────────────────────────────────
 SCAN_INTERVAL_SECS   = int(os.getenv("SCAN_INTERVAL_SECS",   "2"))
-SCAN_LOG_EVERY       = int(os.getenv("SCAN_LOG_EVERY",       "15"))
 MIN_GAIN_TO_SHOW     = float(os.getenv("MIN_GAIN_TO_SHOW",   "0"))
 COOLDOWN_SECONDS     = int(os.getenv("COOLDOWN_SECONDS",     "86400"))
 
@@ -144,7 +143,7 @@ TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
 # MODELOS DE DATOS
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclass(slots=True)
+@dataclass
 class Fill:
     level:       float
     notional:    float
@@ -152,17 +151,8 @@ class Fill:
     qty:         float
     opened_at:   float = field(default_factory=time.time)
 
-    def to_dict(self) -> dict:
-        return {
-            "level":       self.level,
-            "notional":    self.notional,
-            "entry_price": self.entry_price,
-            "qty":         self.qty,
-            "opened_at":   self.opened_at,
-        }
 
-
-@dataclass(slots=True)
+@dataclass
 class BotPosition:
     symbol:       str
     fills:        List[Fill] = field(default_factory=list)
@@ -332,7 +322,6 @@ class TradingBot:
         self.exchange_symbols     = 0
         self.started_at           = time.time()
         self._sse_snapshot: str   = "{}"
-        self._last_persist_at: float = 0.0
 
         self.loop:   Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
@@ -344,8 +333,7 @@ class TradingBot:
         line  = f"{stamp} | {msg}"
         print(line, flush=True)
         with self.lock:
-            self.events.insert(0, line)
-            del self.events[100:]
+            self.events = [line, *self.events[:99]]
 
     # ── Start / Stop ──────────────────────────────────────────────────────────
 
@@ -456,27 +444,21 @@ class TradingBot:
             ]
 
     def _start_price_cache(self, symbols: List[str]) -> None:
-        normalized = [s.upper() for s in symbols]
-        if self.price_cache and self.subscribed_symbols == normalized:
-            return
         self._stop_price_cache()
-        if not normalized:
+        if not symbols:
             return
         self.price_cache = SymbolWebSocketPriceCache(
-            normalized,
+            symbols,
             symbols_per_connection=30,
         )
         self.price_cache.start()
-        self.log(f"PriceCache iniciado con {len(normalized)} símbolos (markPrice + @ticker)")
+        self.log(f"PriceCache iniciado con {len(symbols)} símbolos (markPrice + @ticker)")
 
     def _start_kline_cache(self, symbols: List[str]) -> None:
-        normalized = [s.upper() for s in symbols]
-        if self.kline_cache and self.subscribed_symbols == normalized:
-            return
         self._stop_kline_cache()
-        if not normalized:
+        if not symbols:
             return
-        pairs = {sym: ["1m"] for sym in normalized}
+        pairs = {sym: ["1m"] for sym in symbols}
         self.kline_cache = KlineWebSocketCache(
             pairs                           = pairs,
             max_candles                     = 1,
@@ -490,7 +472,7 @@ class TradingBot:
             safety_refresh_interval_seconds = 1500,
         )
         self.kline_cache.start()
-        self.log(f"KlineCache iniciado con {len(normalized)} símbolos (1m)")
+        self.log(f"KlineCache iniciado con {len(symbols)} símbolos (1m)")
 
     # ── Caché de símbolos en disco ─────────────────────────────────────────────
 
@@ -583,35 +565,49 @@ class TradingBot:
             return False
 
     async def _init_all_symbols(self) -> None:
-          # Intento 1: caché en disco
-          cached = self._load_symbols_from_cache()
-          if cached:
-              self.all_symbols             = cached
-              self.last_symbols_refresh_at = time.time()
-              asyncio.ensure_future(self._maybe_refresh_symbols_cache())
-              return
-           # Intento 2: lista inicial fija 
-          if INITIAL_SYMBOLS:
-              self.all_symbols             = INITIAL_SYMBOLS.copy()
-              self.last_symbols_refresh_at = time.time()
-              self.log(f"Usando lista inicial fija: {len(self.all_symbols)} símbolos")
-              return
-          # Intento 3: REST
-          success = await self._refresh_all_symbols()
-          if success:
-              return        
-          # Intento 4: exchange_filters como último recurso
-          if self.client.exchange_filters:
-              self.all_symbols             = list(self.client.exchange_filters.keys())
-              self.last_symbols_refresh_at = time.time()
-              self.log(f"Usando exchange_filters como fallback: {len(self.all_symbols)} símbolos")
-              return
-      
-          self.log(
-              "ADVERTENCIA: No hay símbolos disponibles. "
-              "El bot esperará hasta que se obtenga la lista."
-          )
-     
+        """
+        Carga inicial de símbolos:
+          1. Intenta leer desde caché en disco (rápido, sin REST).
+          2. Si el caché está vacío o falla, hace REST a exchangeInfo.
+          3. Si el REST también falla, usa exchange_filters como último recurso.
+        """
+        # Intento 1: caché en disco
+        cached = self._load_symbols_from_cache()
+        if cached:
+            self.all_symbols             = cached
+            self.last_symbols_refresh_at = time.time()  # no forzar refresh inmediato
+            # Lanzar refresh en background para actualizar si el caché es viejo
+            asyncio.ensure_future(self._maybe_refresh_symbols_cache())
+            return
+
+        # Intento 2: REST
+        success = await self._refresh_all_symbols()
+        if success:
+            return
+
+        # Intento 3: exchange_filters (cargados al inicio desde exchangeInfo)
+        if self.client.exchange_filters:
+            self.all_symbols = list(self.client.exchange_filters.keys())
+            self.log(
+                f"Usando exchange_filters como fallback: {len(self.all_symbols)} símbolos"
+            )
+            
+            return
+        
+        # Intento 4: lista inicial fija
+        if INITIAL_SYMBOLS:
+            self.all_symbols = INITIAL_SYMBOLS.copy()
+            self.last_symbols_refresh_at = time.time()
+            self.log(
+                f"Usando lista inicial fija: {len(self.all_symbols)} símbolos"
+            )
+        
+        else:
+            self.log(
+                "ADVERTENCIA: No hay símbolos disponibles. "
+                "El bot esperará hasta que se obtenga la lista."
+            )
+
     async def _maybe_refresh_symbols_cache(self) -> None:
         """Refresca el caché si tiene más de SYMBOL_REFRESH_HOURS horas."""
         age = time.time() - self.last_symbols_refresh_at
@@ -764,7 +760,7 @@ class TradingBot:
                 self.last_filter_cycle_at = time.time()
                 self.filter_cycle_count  += 1
 
-            # La persistencia completa se hace solo en eventos de trade.
+            self.persist_state()
 
             # ── Esperar siguiente ciclo ───────────────────────────────────
             try:
@@ -850,9 +846,10 @@ class TradingBot:
         if not self.kline_cache:
             return True
         try:
-            last = self.kline_cache.get_last_closed(symbol, "1m")
-            if not last:
+            df = self.kline_cache.get_dataframe(symbol, "1m", only_closed=True)
+            if df.empty or len(df) < 2:
                 return True
+            last = df.iloc[-1]
             return float(last["close"]) >= float(last["open"])
         except Exception:
             return True
@@ -944,14 +941,13 @@ class TradingBot:
                     }
                     n_cool = len(self.symbol_cooldown)
 
-                if SCAN_LOG_EVERY > 0 and self.scan_count % SCAN_LOG_EVERY == 0:
-                    n_high = sum(1 for w in winners if w["change"] >= ENTRY_LEVELS[0])
-                    self.log(
-                        f"Escan #{self.scan_count}: {len(winners)} activos | "
-                        f">={ENTRY_LEVELS[0]:.0f}%: {n_high} | "
-                        f"posiciones: {len(self.positions)} | cooldown: {n_cool}"
-                    )
-                # Evita escribir JSON a disco en cada escaneo; solo persistimos en trades.
+                n_high = sum(1 for w in winners if w["change"] >= ENTRY_LEVELS[0])
+                self.log(
+                    f"Escan #{self.scan_count}: {len(winners)} activos | "
+                    f">={ENTRY_LEVELS[0]:.0f}%: {n_high} | "
+                    f"posiciones: {len(self.positions)} | cooldown: {n_cool}"
+                )
+                self.persist_state()
 
             except asyncio.CancelledError:
                 if not self.running:
@@ -975,10 +971,11 @@ class TradingBot:
         while self.running:
             try:
                 if self.price_cache and self.positions:
+                    all_prices = self.price_cache.get_all_prices()
                     with self.lock:
                         pos_syms = list(self.positions.keys())
                     for symbol in pos_syms:
-                        price = self.price_cache.get_price(symbol)
+                        price = all_prices.get(symbol)
                         if price and price > 0:
                             await self._maybe_take_profit(symbol, price)
             except asyncio.CancelledError:
@@ -1161,7 +1158,7 @@ class TradingBot:
                 "notional":       pos.notional,
                 "target":         pos.notional * TAKE_PROFIT_FRACTION,
                 "unrealized_pnl": pnl,
-                "fills":          [f.to_dict() for f in pos.fills],
+                "fills":          [f.__dict__ for f in pos.fills],
                 "change":         next(
                     (w["change"] for w in winners_raw if w["symbol"] == symbol), 0.0
                 ),
@@ -1217,8 +1214,7 @@ class TradingBot:
             # Símbolos
             "all_symbols_count":    all_symbols_count,
             "subscribed_count":     len(self.subscribed_symbols),
-            "subscribed_symbols":   self.subscribed_symbols[:25],
-            "subscribed_symbols_truncated": len(self.subscribed_symbols) > 25,
+            "subscribed_symbols":   self.subscribed_symbols,
             # WS ticker (actualizaciones entre ciclos)
             "last_ws_ticker_text":  last_ws_ticker_text,
             "ws_ticker_updates":    ws_ticker_updates,
@@ -1238,8 +1234,7 @@ class TradingBot:
             "cooldown_count":    len(active_cooldowns),
             "cooldowns":         active_cooldowns,
             "cooldown_hours":    COOLDOWN_SECONDS / 3600,
-            "price_blocked":     sorted(price_blocked_snap)[:100],
-            "price_blocked_truncated": len(price_blocked_snap) > 100,
+            "price_blocked":     sorted(price_blocked_snap),
             "price_blocked_count": len(price_blocked_snap),
             "max_price_block":   MAX_PRICE_BLOCK,
             "price_ws": {
@@ -1258,89 +1253,8 @@ class TradingBot:
 
     # ── Persistencia ──────────────────────────────────────────────────────────
 
-    def _build_persisted_state(self) -> dict:
-        """Estado mínimo para disco: evita reconstruir/enviar el snapshot web completo."""
-        now = time.time()
-        with self.lock:
-            active_cooldowns = {
-                sym: {
-                    "remaining_s": round(ts - now, 0),
-                    "remaining_str": self._fmt_cooldown(ts - now),
-                    "unblock_utc": datetime.fromtimestamp(ts, timezone.utc).strftime(
-                        "%Y-%m-%d %H:%M UTC"
-                    ),
-                }
-                for sym, ts in self.symbol_cooldown.items() if ts > now
-            }
-            positions = [
-                {
-                    "symbol": pos.symbol,
-                    "status": pos.status,
-                    "avg_entry": pos.avg_entry,
-                    "qty": pos.qty,
-                    "notional": pos.notional,
-                    "target": pos.notional * TAKE_PROFIT_FRACTION,
-                    "mark_price": 0.0,
-                    "unrealized_pnl": 0.0,
-                    "change": 0.0,
-                    "fills": [f.to_dict() for f in pos.fills],
-                    "realized_pnl": pos.realized_pnl,
-                }
-                for pos in self.positions.values()
-                if pos.fills
-            ]
-            return {
-                "mode": "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL",
-                "running": self.running,
-                "thread_alive": bool(self.thread and self.thread.is_alive()),
-                "started_at": self.started_at,
-                "uptime_seconds": round(now - self.started_at, 1),
-                "scan_count": self.scan_count,
-                "last_scan_text": (
-                    datetime.fromtimestamp(self.last_scan_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    if self.last_scan_at else "pendiente"
-                ),
-                "filter_cycle_count": self.filter_cycle_count,
-                "last_filter_text": (
-                    datetime.fromtimestamp(self.last_filter_cycle_at, timezone.utc).strftime("%H:%M:%S UTC")
-                    if self.last_filter_cycle_at else "pendiente"
-                ),
-                "next_filter_text": "pronto",
-                "filter_cycle_secs": FILTER_CYCLE_SECS,
-                "min_gain_filter": MIN_GAIN_FILTER,
-                "full_subscribe_wait": FULL_SUBSCRIBE_WAIT_SECS,
-                "all_symbols_count": len(self.all_symbols),
-                "subscribed_count": len(self.subscribed_symbols),
-                "subscribed_symbols": self.subscribed_symbols[:25],
-                "subscribed_symbols_truncated": len(self.subscribed_symbols) > 25,
-                "last_ws_ticker_text": "pendiente",
-                "ws_ticker_updates": self.ws_ticker_update_count,
-                "last_error": self.last_error,
-                "last_startup_err": self.last_startup_err,
-                "exchange_symbols": self.exchange_symbols,
-                "entry_levels": ENTRY_LEVELS,
-                "entry_notionals": ENTRY_NOTIONALS,
-                "take_profit_pct": TAKE_PROFIT_FRACTION * 100,
-                "total_unrealized": 0.0,
-                "total_notional": sum(pos["notional"] for pos in positions),
-                "positions": positions,
-                "winners": [],
-                "closed_trades": list(self.closed_trades[:30]),
-                "events": list(self.events[:20]),
-                "cooldowns": active_cooldowns,
-                "cooldown_count": len(active_cooldowns),
-                "cooldown_hours": COOLDOWN_SECONDS / 3600,
-                "price_blocked": sorted(self.price_blocked)[:100],
-                "price_blocked_truncated": len(self.price_blocked) > 100,
-                "price_blocked_count": len(self.price_blocked),
-                "max_price_block": MAX_PRICE_BLOCK,
-                "price_ws": {"active_prices": 0, "active_tickers": 0, "total": 0, "stale": 0},
-                "kline_ws": {"pairs_with_data": 0, "total_messages": 0, "active_conns": 0},
-                "ts": now,
-            }
-
     def persist_state(self) -> None:
-        snap = self._build_persisted_state()
+        snap = self._build_snapshot()
         if not snap["positions"] and not snap["closed_trades"] and snap["scan_count"] <= 0:
             return
         tmp = f"{STATE_FILE}.tmp"
@@ -1348,19 +1262,12 @@ class TradingBot:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(snap, fh, ensure_ascii=False, default=str)
             os.replace(tmp, STATE_FILE)
-            self._last_persist_at = time.time()
         except Exception as exc:
             self.log(f"No pude persistir estado: {exc}")
 
     def snapshot(self) -> dict:
-        try:
-            live = json.loads(self._sse_snapshot)
-        except Exception:
-            live = {}
-        if not isinstance(live, dict) or not live:
-            live = self._build_snapshot()
-
-        if not live.get("positions") and not live.get("winners") and os.path.exists(STATE_FILE):
+        live = self._build_snapshot()
+        if not live["positions"] and not live["winners"] and os.path.exists(STATE_FILE):
             try:
                 with open(STATE_FILE, "r", encoding="utf-8") as fh:
                     persisted = json.load(fh)
