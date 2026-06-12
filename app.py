@@ -610,6 +610,12 @@ class TradingBot:
                 "El bot esperará hasta que se obtenga la lista."
             )
 
+            self.all_symbols = INITIAL_SYMBOLS.copy()
+            self.last_symbols_refresh_at = time.time()
+            self.log(
+                f"Usando lista inicial fija: {len(self.all_symbols)} símbolos"
+            )
+
     async def _maybe_refresh_symbols_cache(self) -> None:
         """Refresca el caché si tiene más de SYMBOL_REFRESH_HOURS horas."""
         age = time.time() - self.last_symbols_refresh_at
