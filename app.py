@@ -125,6 +125,7 @@ WS_TICKER_UPDATE_SECS = float(os.getenv("WS_TICKER_UPDATE_SECS", "5.0"))
 
 # ── Resto de parámetros operativos ────────────────────────────────────────────
 SCAN_INTERVAL_SECS   = int(os.getenv("SCAN_INTERVAL_SECS",   "2"))
+SCAN_LOG_EVERY       = int(os.getenv("SCAN_LOG_EVERY",       "15"))
 MIN_GAIN_TO_SHOW     = float(os.getenv("MIN_GAIN_TO_SHOW",   "0"))
 COOLDOWN_SECONDS     = int(os.getenv("COOLDOWN_SECONDS",     "86400"))
 
@@ -331,6 +332,7 @@ class TradingBot:
         self.exchange_symbols     = 0
         self.started_at           = time.time()
         self._sse_snapshot: str   = "{}"
+        self._last_persist_at: float = 0.0
 
         self.loop:   Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
@@ -764,7 +766,7 @@ class TradingBot:
                 self.last_filter_cycle_at = time.time()
                 self.filter_cycle_count  += 1
 
-            self.persist_state()
+            # La persistencia completa se hace solo en eventos de trade.
 
             # ── Esperar siguiente ciclo ───────────────────────────────────
             try:
@@ -944,13 +946,14 @@ class TradingBot:
                     }
                     n_cool = len(self.symbol_cooldown)
 
-                n_high = sum(1 for w in winners if w["change"] >= ENTRY_LEVELS[0])
-                self.log(
-                    f"Escan #{self.scan_count}: {len(winners)} activos | "
-                    f">={ENTRY_LEVELS[0]:.0f}%: {n_high} | "
-                    f"posiciones: {len(self.positions)} | cooldown: {n_cool}"
-                )
-                self.persist_state()
+                if SCAN_LOG_EVERY > 0 and self.scan_count % SCAN_LOG_EVERY == 0:
+                    n_high = sum(1 for w in winners if w["change"] >= ENTRY_LEVELS[0])
+                    self.log(
+                        f"Escan #{self.scan_count}: {len(winners)} activos | "
+                        f">={ENTRY_LEVELS[0]:.0f}%: {n_high} | "
+                        f"posiciones: {len(self.positions)} | cooldown: {n_cool}"
+                    )
+                # Evita escribir JSON a disco en cada escaneo; solo persistimos en trades.
 
             except asyncio.CancelledError:
                 if not self.running:
@@ -974,11 +977,10 @@ class TradingBot:
         while self.running:
             try:
                 if self.price_cache and self.positions:
-                    all_prices = self.price_cache.get_all_prices()
                     with self.lock:
                         pos_syms = list(self.positions.keys())
                     for symbol in pos_syms:
-                        price = all_prices.get(symbol)
+                        price = self.price_cache.get_price(symbol)
                         if price and price > 0:
                             await self._maybe_take_profit(symbol, price)
             except asyncio.CancelledError:
@@ -1217,7 +1219,8 @@ class TradingBot:
             # Símbolos
             "all_symbols_count":    all_symbols_count,
             "subscribed_count":     len(self.subscribed_symbols),
-            "subscribed_symbols":   self.subscribed_symbols,
+            "subscribed_symbols":   self.subscribed_symbols[:25],
+            "subscribed_symbols_truncated": len(self.subscribed_symbols) > 25,
             # WS ticker (actualizaciones entre ciclos)
             "last_ws_ticker_text":  last_ws_ticker_text,
             "ws_ticker_updates":    ws_ticker_updates,
@@ -1237,7 +1240,8 @@ class TradingBot:
             "cooldown_count":    len(active_cooldowns),
             "cooldowns":         active_cooldowns,
             "cooldown_hours":    COOLDOWN_SECONDS / 3600,
-            "price_blocked":     sorted(price_blocked_snap),
+            "price_blocked":     sorted(price_blocked_snap)[:100],
+            "price_blocked_truncated": len(price_blocked_snap) > 100,
             "price_blocked_count": len(price_blocked_snap),
             "max_price_block":   MAX_PRICE_BLOCK,
             "price_ws": {
@@ -1256,8 +1260,89 @@ class TradingBot:
 
     # ── Persistencia ──────────────────────────────────────────────────────────
 
+    def _build_persisted_state(self) -> dict:
+        """Estado mínimo para disco: evita reconstruir/enviar el snapshot web completo."""
+        now = time.time()
+        with self.lock:
+            active_cooldowns = {
+                sym: {
+                    "remaining_s": round(ts - now, 0),
+                    "remaining_str": self._fmt_cooldown(ts - now),
+                    "unblock_utc": datetime.fromtimestamp(ts, timezone.utc).strftime(
+                        "%Y-%m-%d %H:%M UTC"
+                    ),
+                }
+                for sym, ts in self.symbol_cooldown.items() if ts > now
+            }
+            positions = [
+                {
+                    "symbol": pos.symbol,
+                    "status": pos.status,
+                    "avg_entry": pos.avg_entry,
+                    "qty": pos.qty,
+                    "notional": pos.notional,
+                    "target": pos.notional * TAKE_PROFIT_FRACTION,
+                    "mark_price": 0.0,
+                    "unrealized_pnl": 0.0,
+                    "change": 0.0,
+                    "fills": [f.to_dict() for f in pos.fills],
+                    "realized_pnl": pos.realized_pnl,
+                }
+                for pos in self.positions.values()
+                if pos.fills
+            ]
+            return {
+                "mode": "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL",
+                "running": self.running,
+                "thread_alive": bool(self.thread and self.thread.is_alive()),
+                "started_at": self.started_at,
+                "uptime_seconds": round(now - self.started_at, 1),
+                "scan_count": self.scan_count,
+                "last_scan_text": (
+                    datetime.fromtimestamp(self.last_scan_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    if self.last_scan_at else "pendiente"
+                ),
+                "filter_cycle_count": self.filter_cycle_count,
+                "last_filter_text": (
+                    datetime.fromtimestamp(self.last_filter_cycle_at, timezone.utc).strftime("%H:%M:%S UTC")
+                    if self.last_filter_cycle_at else "pendiente"
+                ),
+                "next_filter_text": "pronto",
+                "filter_cycle_secs": FILTER_CYCLE_SECS,
+                "min_gain_filter": MIN_GAIN_FILTER,
+                "full_subscribe_wait": FULL_SUBSCRIBE_WAIT_SECS,
+                "all_symbols_count": len(self.all_symbols),
+                "subscribed_count": len(self.subscribed_symbols),
+                "subscribed_symbols": self.subscribed_symbols[:25],
+                "subscribed_symbols_truncated": len(self.subscribed_symbols) > 25,
+                "last_ws_ticker_text": "pendiente",
+                "ws_ticker_updates": self.ws_ticker_update_count,
+                "last_error": self.last_error,
+                "last_startup_err": self.last_startup_err,
+                "exchange_symbols": self.exchange_symbols,
+                "entry_levels": ENTRY_LEVELS,
+                "entry_notionals": ENTRY_NOTIONALS,
+                "take_profit_pct": TAKE_PROFIT_FRACTION * 100,
+                "total_unrealized": 0.0,
+                "total_notional": sum(pos["notional"] for pos in positions),
+                "positions": positions,
+                "winners": [],
+                "closed_trades": list(self.closed_trades[:30]),
+                "events": list(self.events[:20]),
+                "cooldowns": active_cooldowns,
+                "cooldown_count": len(active_cooldowns),
+                "cooldown_hours": COOLDOWN_SECONDS / 3600,
+                "price_blocked": sorted(self.price_blocked)[:100],
+                "price_blocked_truncated": len(self.price_blocked) > 100,
+                "price_blocked_count": len(self.price_blocked),
+                "max_price_block": MAX_PRICE_BLOCK,
+                "price_ws": {"active_prices": 0, "active_tickers": 0, "total": 0, "stale": 0},
+                "kline_ws": {"pairs_with_data": 0, "total_messages": 0, "active_conns": 0},
+                "ts": now,
+            }
+
     def persist_state(self) -> None:
-        snap = self._build_snapshot()
+        snap = self._build_persisted_state()
         if not snap["positions"] and not snap["closed_trades"] and snap["scan_count"] <= 0:
             return
         tmp = f"{STATE_FILE}.tmp"
@@ -1265,12 +1350,19 @@ class TradingBot:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(snap, fh, ensure_ascii=False, default=str)
             os.replace(tmp, STATE_FILE)
+            self._last_persist_at = time.time()
         except Exception as exc:
             self.log(f"No pude persistir estado: {exc}")
 
     def snapshot(self) -> dict:
-        live = self._build_snapshot()
-        if not live["positions"] and not live["winners"] and os.path.exists(STATE_FILE):
+        try:
+            live = json.loads(self._sse_snapshot)
+        except Exception:
+            live = {}
+        if not isinstance(live, dict) or not live:
+            live = self._build_snapshot()
+
+        if not live.get("positions") and not live.get("winners") and os.path.exists(STATE_FILE):
             try:
                 with open(STATE_FILE, "r", encoding="utf-8") as fh:
                     persisted = json.load(fh)
