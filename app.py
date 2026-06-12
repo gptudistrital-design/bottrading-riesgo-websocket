@@ -117,7 +117,7 @@ SYMBOL_REFRESH_HOURS = int(os.getenv("SYMBOL_REFRESH_HOURS", "12"))
 # ── Ciclo de filtrado ─────────────────────────────────────────────────────────
 # Cada FILTER_CYCLE_SECS: suscribir todos → esperar ticker → filtrar → desuscribir resto
 FILTER_CYCLE_SECS        = int(os.getenv("FILTER_CYCLE_SECS",        "300"))  # 5 min
-MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "15.0"))  # >=15% para quedar suscrito
+MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "40.0"))  # >=15% para quedar suscrito
 FULL_SUBSCRIBE_WAIT_SECS = int(os.getenv("FULL_SUBSCRIBE_WAIT_SECS", "30"))   # espera ticker tras sub ALL
 
 # ── Actualización en tiempo real del ranking (entre ciclos de filtrado) ───────
