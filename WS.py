@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import websockets
 import json
 import threading
@@ -323,11 +324,20 @@ class SymbolWebSocketPriceCache:
 
         print("✅ WebSocket cache iniciado (markPrice + ticker 24h)")
 
+    async def _cancel_pending_tasks(self):
+        """Cancela y drena tareas del loop antes de cerrarlo."""
+        current = asyncio.current_task()
+        pending = [task for task in asyncio.all_tasks() if task is not current and not task.done()]
+        if not pending:
+            return
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
     def stop(self):
-        """Detiene todas las conexiones."""
+        """Detiene todas las conexiones y espera el cierre de websockets."""
         print("🛑 Deteniendo WebSocket cache…")
         self.running = False
-        time.sleep(2)
 
         for task in self.tasks:
             try:
@@ -335,11 +345,19 @@ class SymbolWebSocketPriceCache:
             except Exception:
                 pass
 
-        if self._loop:
+        if self.tasks:
+            concurrent.futures.wait(self.tasks, timeout=5.0)
+
+        if self._loop and self._loop.is_running():
+            try:
+                cleanup = asyncio.run_coroutine_threadsafe(self._cancel_pending_tasks(), self._loop)
+                cleanup.result(timeout=5.0)
+            except Exception:
+                pass
             self._loop.call_soon_threadsafe(self._loop.stop)
 
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=3.0)
+            self.thread.join(timeout=5.0)
 
         if self._loop:
             try:
