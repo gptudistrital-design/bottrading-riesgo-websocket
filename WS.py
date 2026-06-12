@@ -3,7 +3,7 @@ import websockets
 import json
 import threading
 import time
-import numpy as np
+import math
 from collections import defaultdict
 from datetime import datetime
 import os
@@ -11,7 +11,7 @@ import os
 
 class SymbolWebSocketPriceCache:
     """WebSocket optimizado para múltiples símbolos con conexiones agrupadas.
-    
+
     Streams activos por símbolo:
       • @markPrice@1s  → precio mark en tiempo real
       • @ticker        → cambio 24h, high/low, volumen (actualización en tiempo real)
@@ -30,6 +30,7 @@ class SymbolWebSocketPriceCache:
         self.ticker_last_update: dict[str, float] = {} # symbol -> timestamp
 
         self.tasks = []
+        self.thread = None
         self.lock = threading.Lock()
         self.running = False
         self._loop = None
@@ -66,8 +67,8 @@ class SymbolWebSocketPriceCache:
                     ping_interval=30,
                     ping_timeout=10,
                     close_timeout=10,
-                    max_size=10 ** 7,
-                    max_queue=2000,
+                    max_size=512 * 1024,
+                    max_queue=64,
                     compression=None,
                 ) as ws:
                     print(f"✅ [markPrice] Conectado: {group_id} ({len(symbols_group)} símbolos)")
@@ -85,7 +86,7 @@ class SymbolWebSocketPriceCache:
                                 symbol = price_data.get("s", "").upper()
                                 price = float(price_data.get("p", 0.0))
 
-                                if symbol and np.isfinite(price) and price > 0:
+                                if symbol and math.isfinite(price) and price > 0:
                                     with self.lock:
                                         self.price_cache[symbol] = price
                                         self.last_update[symbol] = time.time()
@@ -144,8 +145,8 @@ class SymbolWebSocketPriceCache:
                     ping_interval=30,
                     ping_timeout=10,
                     close_timeout=10,
-                    max_size=10 ** 7,
-                    max_queue=2000,
+                    max_size=512 * 1024,
+                    max_queue=64,
                     compression=None,
                 ) as ws:
                     print(f"✅ [ticker24h] Conectado: {group_id} ({len(symbols_group)} símbolos)")
@@ -228,7 +229,13 @@ class SymbolWebSocketPriceCache:
         while self.running:
             try:
                 async with websockets.connect(
-                    url, ping_interval=30, ping_timeout=10, close_timeout=10
+                    url,
+                    ping_interval=30,
+                    ping_timeout=10,
+                    close_timeout=10,
+                    max_size=256 * 1024,
+                    max_queue=32,
+                    compression=None,
                 ) as ws:
                     print(f"🟢 WS individual para {symbol}")
                     reconnect_delay = 1
@@ -239,7 +246,7 @@ class SymbolWebSocketPriceCache:
                             data = json.loads(msg)
                             price = float(data.get("p", 0.0))
 
-                            if np.isfinite(price) and price > 0:
+                            if math.isfinite(price) and price > 0:
                                 with self.lock:
                                     self.price_cache[symbol] = price
                                     self.last_update[symbol] = time.time()
@@ -293,6 +300,7 @@ class SymbolWebSocketPriceCache:
 
         thread = threading.Thread(target=run_loop, daemon=True)
         thread.start()
+        self.thread = thread
 
         symbol_groups = self._create_symbol_groups()
         print(f"📊 Iniciando streams para {len(self.symbols)} símbolos "
@@ -330,6 +338,26 @@ class SymbolWebSocketPriceCache:
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
 
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=3.0)
+
+        if self._loop:
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+
+        with self.lock:
+            self.price_cache.clear()
+            self.last_update.clear()
+            self.ticker_cache.clear()
+            self.ticker_last_update.clear()
+
+        self.tasks.clear()
+        self.connection_stats.clear()
+        self.thread = None
+        self._loop = None
+
         print("✅ WebSocket cache detenido")
 
     # ──────────────────────────────────────────────────────────────────────
@@ -358,7 +386,7 @@ class SymbolWebSocketPriceCache:
 
     def get_ticker(self, symbol: str) -> dict | None:
         """Ticker completo 24h de un símbolo.
-        
+
         Retorna dict con: change_pct, change_abs, last_price,
                           high_24h, low_24h, volume_24h, quote_vol
         O None si todavía no hay datos.
@@ -369,7 +397,7 @@ class SymbolWebSocketPriceCache:
 
     def get_all_changes_24h(self) -> dict[str, float]:
         """Porcentaje de cambio 24h de todos los símbolos disponibles.
-        
+
         Retorna {symbol: change_pct, ...}, ordenado de mayor a menor cambio.
         """
         with self.lock:

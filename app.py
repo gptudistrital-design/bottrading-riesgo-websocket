@@ -143,7 +143,7 @@ TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
 # MODELOS DE DATOS
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclass
+@dataclass(slots=True)
 class Fill:
     level:       float
     notional:    float
@@ -151,8 +151,17 @@ class Fill:
     qty:         float
     opened_at:   float = field(default_factory=time.time)
 
+    def to_dict(self) -> dict:
+        return {
+            "level":       self.level,
+            "notional":    self.notional,
+            "entry_price": self.entry_price,
+            "qty":         self.qty,
+            "opened_at":   self.opened_at,
+        }
 
-@dataclass
+
+@dataclass(slots=True)
 class BotPosition:
     symbol:       str
     fills:        List[Fill] = field(default_factory=list)
@@ -333,7 +342,8 @@ class TradingBot:
         line  = f"{stamp} | {msg}"
         print(line, flush=True)
         with self.lock:
-            self.events = [line, *self.events[:99]]
+            self.events.insert(0, line)
+            del self.events[100:]
 
     # ── Start / Stop ──────────────────────────────────────────────────────────
 
@@ -444,21 +454,27 @@ class TradingBot:
             ]
 
     def _start_price_cache(self, symbols: List[str]) -> None:
+        normalized = [s.upper() for s in symbols]
+        if self.price_cache and self.subscribed_symbols == normalized:
+            return
         self._stop_price_cache()
-        if not symbols:
+        if not normalized:
             return
         self.price_cache = SymbolWebSocketPriceCache(
-            symbols,
+            normalized,
             symbols_per_connection=30,
         )
         self.price_cache.start()
-        self.log(f"PriceCache iniciado con {len(symbols)} símbolos (markPrice + @ticker)")
+        self.log(f"PriceCache iniciado con {len(normalized)} símbolos (markPrice + @ticker)")
 
     def _start_kline_cache(self, symbols: List[str]) -> None:
-        self._stop_kline_cache()
-        if not symbols:
+        normalized = [s.upper() for s in symbols]
+        if self.kline_cache and self.subscribed_symbols == normalized:
             return
-        pairs = {sym: ["1m"] for sym in symbols}
+        self._stop_kline_cache()
+        if not normalized:
+            return
+        pairs = {sym: ["1m"] for sym in normalized}
         self.kline_cache = KlineWebSocketCache(
             pairs                           = pairs,
             max_candles                     = 1,
@@ -472,7 +488,7 @@ class TradingBot:
             safety_refresh_interval_seconds = 1500,
         )
         self.kline_cache.start()
-        self.log(f"KlineCache iniciado con {len(symbols)} símbolos (1m)")
+        self.log(f"KlineCache iniciado con {len(normalized)} símbolos (1m)")
 
     # ── Caché de símbolos en disco ─────────────────────────────────────────────
 
@@ -846,10 +862,9 @@ class TradingBot:
         if not self.kline_cache:
             return True
         try:
-            df = self.kline_cache.get_dataframe(symbol, "1m", only_closed=True)
-            if df.empty or len(df) < 2:
+            last = self.kline_cache.get_last_closed(symbol, "1m")
+            if not last:
                 return True
-            last = df.iloc[-1]
             return float(last["close"]) >= float(last["open"])
         except Exception:
             return True
@@ -1158,7 +1173,7 @@ class TradingBot:
                 "notional":       pos.notional,
                 "target":         pos.notional * TAKE_PROFIT_FRACTION,
                 "unrealized_pnl": pnl,
-                "fills":          [f.__dict__ for f in pos.fills],
+                "fills":          [f.to_dict() for f in pos.fills],
                 "change":         next(
                     (w["change"] for w in winners_raw if w["symbol"] == symbol), 0.0
                 ),
