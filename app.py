@@ -601,23 +601,22 @@ class TradingBot:
         if success:
             return
 
-        # Intento 3: exchange_filters (cargados al inicio desde exchangeInfo)
-        if self.client.exchange_filters:
-            self.all_symbols = list(self.client.exchange_filters.keys())
-            self.log(
-                f"Usando exchange_filters como fallback: {len(self.all_symbols)} símbolos"
-            )
-            
-            return
-        
-        # Intento 4: lista inicial fija
+        # Intento 3: lista inicial fija
         if INITIAL_SYMBOLS:
             self.all_symbols = INITIAL_SYMBOLS.copy()
             self.last_symbols_refresh_at = time.time()
             self.log(
                 f"Usando lista inicial fija: {len(self.all_symbols)} símbolos"
             )
-        
+
+        # Intento 4: exchange_filters (cargados al inicio desde exchangeInfo)
+        if self.client.exchange_filters:
+            self.all_symbols = list(self.client.exchange_filters.keys())
+            self.log(
+                f"Usando exchange_filters como fallback: {len(self.all_symbols)} símbolos"
+            )
+            
+            return        
         else:
             self.log(
                 "ADVERTENCIA: No hay símbolos disponibles. "
