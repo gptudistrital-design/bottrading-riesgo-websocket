@@ -590,17 +590,15 @@ class TradingBot:
               self.last_symbols_refresh_at = time.time()
               asyncio.ensure_future(self._maybe_refresh_symbols_cache())
               return
-      
-          # Intento 2: REST
-          success = await self._refresh_all_symbols()
-          if success:
-              return
-      
-          # Intento 3: lista inicial fija 
+           # Intento 2: lista inicial fija 
           if INITIAL_SYMBOLS:
               self.all_symbols             = INITIAL_SYMBOLS.copy()
               self.last_symbols_refresh_at = time.time()
               self.log(f"Usando lista inicial fija: {len(self.all_symbols)} símbolos")
+              return
+          # Intento 3: REST
+          success = await self._refresh_all_symbols()
+          if success:
               return        
           # Intento 4: exchange_filters como último recurso
           if self.client.exchange_filters:
