@@ -110,12 +110,11 @@ SYMBOL_REFRESH_HOURS = int(os.getenv("SYMBOL_REFRESH_HOURS", "12"))
 # ── Ciclo de filtrado ─────────────────────────────────────────────────────────
 # Cada FILTER_CYCLE_SECS: suscribir todos → esperar ticker → filtrar → desuscribir resto
 FILTER_CYCLE_SECS        = int(os.getenv("FILTER_CYCLE_SECS",        "300"))  # 5 min
-MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "15.0"))  # >=15% para quedar suscrito
+MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "40"))  # >=15% para quedar suscrito
 FULL_SUBSCRIBE_WAIT_SECS = int(os.getenv("FULL_SUBSCRIBE_WAIT_SECS", "30"))   # (legacy) espera ticker sub ALL
 
 # ── Procesamiento por lotes (evita pico de RAM al suscribir 500 símbolos de golpe) ──
-# En vez de suscribir todos al mismo tiempo, se crean WS temporales por lote,
-# se recogen los tickers y se destruyen antes de pasar al siguiente lote.
+# En vez de suscribir todos al mismo tiempo, se crean WS temporales por lote
 FILTER_BATCH_SIZE      = int(os.getenv("FILTER_BATCH_SIZE",      "50"))   # símbolos por lote
 FILTER_BATCH_WAIT_SECS = int(os.getenv("FILTER_BATCH_WAIT_SECS", "10"))   # segundos de espera por lote
 FILTER_BATCH_PAUSE     = float(os.getenv("FILTER_BATCH_PAUSE",   "1.5"))  # pausa entre lotes (segundos)
