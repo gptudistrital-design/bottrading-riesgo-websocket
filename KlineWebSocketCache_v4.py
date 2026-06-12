@@ -49,7 +49,6 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
-import pandas as pd
 import websockets
 
 
@@ -670,8 +669,8 @@ class KlineWebSocketCache:
                     ping_interval=20,
                     ping_timeout=10,
                     close_timeout=10,
-                    max_size=10 ** 7,
-                    max_queue=2_000,
+                    max_size=512 * 1024,
+                    max_queue=64,
                     compression=None,
                 ) as ws:
                     # ── Reconexión: rellenar gap ──────────────────────────────
@@ -1178,17 +1177,31 @@ class KlineWebSocketCache:
     # CONSULTA DE DATOS
     # =========================================================================
 
+    def get_rows(
+        self,
+        symbol: str,
+        interval: str,
+        only_closed: bool = False,
+    ) -> List[dict]:
+        """Retorna una copia ligera del buffer sin construir DataFrames."""
+        key = (symbol.upper(), interval)
+        with self.lock:
+            rows = list(self.buffers.get(key, deque()))
+
+        if only_closed:
+            rows = [row for row in rows if row.get("is_closed", False)]
+        return [dict(row) for row in rows]
+
     def get_dataframe(
         self,
         symbol: str,
         interval: str,
         only_closed: bool = False,
-    ) -> pd.DataFrame:
-        """Retorna el buffer como DataFrame. Thread-safe."""
-        key = (symbol.upper(), interval)
-        with self.lock:
-            rows = list(self.buffers.get(key, deque()))
+    ):
+        """Retorna el buffer como DataFrame, cargando pandas solo bajo demanda."""
+        import pandas as pd
 
+        rows = self.get_rows(symbol, interval, only_closed=only_closed)
         if not rows:
             return pd.DataFrame(columns=[
                 "timestamp", "open", "high", "low", "close", "volume",
@@ -1197,9 +1210,6 @@ class KlineWebSocketCache:
             ])
 
         df = pd.DataFrame(rows)
-        if only_closed:
-            df = df[df["is_closed"]].copy()
-
         df["timestamp"]  = pd.to_datetime(df["open_time"],  unit="ms")
         df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
 
@@ -1210,9 +1220,15 @@ class KlineWebSocketCache:
         ]].reset_index(drop=True)
 
     def get_last_closed(self, symbol: str, interval: str) -> Optional[dict]:
-        """Retorna la última vela CERRADA como dict, o None si no hay."""
-        df = self.get_dataframe(symbol, interval, only_closed=True)
-        return None if df.empty else df.iloc[-1].to_dict()
+        """Retorna la última vela CERRADA como dict, sin depender de pandas."""
+        key = (symbol.upper(), interval)
+        with self.lock:
+            rows = list(self.buffers.get(key, deque()))
+
+        for row in reversed(rows):
+            if row.get("is_closed", False):
+                return dict(row)
+        return None
 
     def get_stream_health(self) -> dict:
         """Estado de salud por (symbol, interval)."""
