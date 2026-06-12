@@ -98,13 +98,52 @@ API_SECRET    = os.getenv("BINANCE_API_SECRET", "")
 LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
 # ── Gestión de símbolos ───────────────────────────────────────────────────────
+def _parse_initial_symbols(raw: Any) -> List[str]:
+    """
+    Normaliza INITIAL_SYMBOLS desde distintos formatos:
+    - CSV: "BTCUSDT,ETHUSDT"
+    - JSON / Python-list: ["BTCUSDT", "ETHUSDT"]
+    - Texto multilínea con comas, punto y coma o saltos de línea
+    """
+    if raw is None:
+        return []
 
-# ── Gestión de símbolos ───────────────────────────────────────────────────────
-INITIAL_SYMBOLS = [
-    s.strip()
-    for s in os.getenv("INITIAL_SYMBOLS", "").split(",")
-    if s.strip()
-]
+    if isinstance(raw, (list, tuple, set)):
+        items = [str(x) for x in raw]
+    else:
+        text = str(raw).strip()
+        if not text:
+            return []
+
+        if text.startswith("[") and text.endswith("]"):
+            parsed = None
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(text)
+                except Exception:
+                    parsed = None
+
+            if isinstance(parsed, (list, tuple, set)):
+                items = [str(x) for x in parsed]
+            else:
+                items = re.split(r"[,\n;]+", text)
+        else:
+            items = re.split(r"[,\n;]+", text)
+
+    cleaned: List[str] = []
+    seen = set()
+    for item in items:
+        sym = str(item).strip().strip('"').strip("'").upper()
+        if not sym:
+            continue
+        if sym not in seen:
+            seen.add(sym)
+            cleaned.append(sym)
+    return cleaned
+
+INITIAL_SYMBOLS = _parse_initial_symbols(os.getenv("INITIAL_SYMBOLS", ""))
 
 # ── Gestión de símbolos ───────────────────────────────────────────────────────
 # Lista completa de símbolos: REST inicial + caché en disco + refresh cada 12 h
