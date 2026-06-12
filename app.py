@@ -601,6 +601,8 @@ class TradingBot:
             self.log(
                 f"Usando lista inicial fija: {len(self.all_symbols)} símbolos"
             )
+
+            return
         
         else:
             self.log(
