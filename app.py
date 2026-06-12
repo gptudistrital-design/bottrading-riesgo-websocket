@@ -118,7 +118,14 @@ SYMBOL_REFRESH_HOURS = int(os.getenv("SYMBOL_REFRESH_HOURS", "12"))
 # Cada FILTER_CYCLE_SECS: suscribir todos → esperar ticker → filtrar → desuscribir resto
 FILTER_CYCLE_SECS        = int(os.getenv("FILTER_CYCLE_SECS",        "300"))  # 5 min
 MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "15.0"))  # >=15% para quedar suscrito
-FULL_SUBSCRIBE_WAIT_SECS = int(os.getenv("FULL_SUBSCRIBE_WAIT_SECS", "30"))   # espera ticker tras sub ALL
+FULL_SUBSCRIBE_WAIT_SECS = int(os.getenv("FULL_SUBSCRIBE_WAIT_SECS", "30"))   # (legacy) espera ticker sub ALL
+
+# ── Procesamiento por lotes (evita pico de RAM al suscribir 500 símbolos de golpe) ──
+# En vez de suscribir todos al mismo tiempo, se crean WS temporales por lote,
+# se recogen los tickers y se destruyen antes de pasar al siguiente lote.
+FILTER_BATCH_SIZE      = int(os.getenv("FILTER_BATCH_SIZE",      "50"))   # símbolos por lote
+FILTER_BATCH_WAIT_SECS = int(os.getenv("FILTER_BATCH_WAIT_SECS", "10"))   # segundos de espera por lote
+FILTER_BATCH_PAUSE     = float(os.getenv("FILTER_BATCH_PAUSE",   "1.5"))  # pausa entre lotes (segundos)
 
 # ── Actualización en tiempo real del ranking (entre ciclos de filtrado) ───────
 WS_TICKER_UPDATE_SECS = float(os.getenv("WS_TICKER_UPDATE_SECS", "5.0"))
@@ -601,7 +608,6 @@ class TradingBot:
             self.log(
                 f"Usando lista inicial fija: {len(self.all_symbols)} símbolos"
             )
-
             return
         
         else:
@@ -639,22 +645,23 @@ class TradingBot:
         """
         Cada FILTER_CYCLE_SECS (5 min):
 
-          Fase 1 — Suscribir TODOS los símbolos (markPrice + @ticker).
-                   Esto incluye los que tienen posiciones abiertas.
+          En lugar de suscribir los ~500 símbolos de golpe (pico de RAM),
+          los procesa en lotes de FILTER_BATCH_SIZE para mantener el uso
+          de memoria bajo y constante durante todo el ciclo.
 
-          Fase 2 — Esperar FULL_SUBSCRIBE_WAIT_SECS para recibir datos de ticker.
+          Por cada lote:
+            Fase 1 — Crear un WS temporal SOLO para ese lote.
+            Fase 2 — Esperar FILTER_BATCH_WAIT_SECS para recibir @ticker.
+            Fase 3 — Recoger tickers y destruir el WS temporal (libera RAM).
+            Pausa   — FILTER_BATCH_PAUSE segundos antes del siguiente lote.
 
-          Fase 3 — Filtrar:
-                   • Mantiene suscritos: change >= MIN_GAIN_FILTER (15%) OR posición abierta
-                   • Descarta el resto
+          Cuando todos los lotes están procesados:
+            Fase 4 — Filtrar: change >= MIN_GAIN_FILTER (15%) OR posición abierta.
+            Fase 5 — Iniciar WS permanente + klines SOLO con los filtrados.
+            Fase 6 — Actualizar self.winners y métricas.
 
-          Fase 4 — Desuscribir el resto: reinicia WS únicamente con la lista filtrada.
-                   Reinicia también kline_cache con la lista filtrada.
-
-          Fase 5 — Actualiza self.winners con los símbolos activos.
-
-        Así ningún movimiento sorpresivo de mercado pasa desapercibido,
-        y la memoria/conexiones se usan solo para los símbolos relevantes.
+        Con FILTER_BATCH_SIZE=50 y 500 símbolos: 10 lotes × (10s + 1.5s) ≈ 2 min.
+        Máximo activo simultáneo: 50 símbolos (~2 conexiones WS) en vez de 500 (~100).
         """
         # Esperar hasta que all_symbols esté poblado
         for _ in range(120):
@@ -669,51 +676,81 @@ class TradingBot:
             return
 
         while self.running:
-            n_total   = len(self.all_symbols)
-            open_syms = set(self._open_position_symbols())
-
-            # Combinar all_symbols + posiciones abiertas (sin duplicados)
+            open_syms       = set(self._open_position_symbols())
             symbols_to_scan = list(dict.fromkeys([*self.all_symbols, *open_syms]))
+            n_total         = len(symbols_to_scan)
+            n_batches       = (n_total + FILTER_BATCH_SIZE - 1) // FILTER_BATCH_SIZE
 
             self.log(
                 f"[filter_cycle] Ciclo #{self.filter_cycle_count + 1}: "
-                f"suscribiendo {len(symbols_to_scan)} símbolos para escaneo completo "
-                f"(posiciones abiertas: {len(open_syms)})..."
+                f"{n_total} símbolos → {n_batches} lotes de {FILTER_BATCH_SIZE} "
+                f"({FILTER_BATCH_WAIT_SECS}s/lote | posiciones abiertas: {len(open_syms)})"
             )
 
-            # ── Fase 1: Suscribir TODOS al WS ────────────────────────────
-            await asyncio.to_thread(self._start_price_cache, symbols_to_scan)
+            # ── Fases 1-2-3: Recoger tickers lote por lote ───────────────
+            all_tickers_collected: Dict[str, dict] = {}
 
-            # ── Fase 2: Esperar datos de @ticker ─────────────────────────
-            self.log(
-                f"[filter_cycle] Esperando {FULL_SUBSCRIBE_WAIT_SECS}s "
-                f"para recibir datos de @ticker..."
-            )
-            try:
-                await asyncio.sleep(FULL_SUBSCRIBE_WAIT_SECS)
-            except asyncio.CancelledError:
+            batches = [
+                symbols_to_scan[i : i + FILTER_BATCH_SIZE]
+                for i in range(0, n_total, FILTER_BATCH_SIZE)
+            ]
+
+            for batch_idx, batch in enumerate(batches, 1):
                 if not self.running:
                     break
+
+                self.log(
+                    f"[filter_cycle]   Lote {batch_idx}/{n_batches}: "
+                    f"{len(batch)} símbolos "
+                    f"({batch[0]} … {batch[-1]})"
+                )
+
+                # WS temporal — completamente aislado de self.price_cache
+                temp_cache = SymbolWebSocketPriceCache(
+                    batch, symbols_per_connection=10
+                )
+                temp_cache.start()
+
+                # Esperar datos de @ticker
+                try:
+                    await asyncio.sleep(FILTER_BATCH_WAIT_SECS)
+                except asyncio.CancelledError:
+                    await asyncio.to_thread(temp_cache.stop)
+                    if not self.running:
+                        return
+                    raise
+
+                # Recoger tickers de este lote
+                try:
+                    tickers = temp_cache.get_all_tickers()
+                    all_tickers_collected.update(tickers)
+                except Exception as exc:
+                    self.log(
+                        f"[filter_cycle]   Error al leer tickers lote {batch_idx}: {exc}"
+                    )
+
+                # Destruir WS temporal → libera conexiones y RAM inmediatamente
+                await asyncio.to_thread(temp_cache.stop)
+
+                # Pausa entre lotes para no saturar el event loop ni Binance
+                if batch_idx < n_batches and self.running:
+                    try:
+                        await asyncio.sleep(FILTER_BATCH_PAUSE)
+                    except asyncio.CancelledError:
+                        if not self.running:
+                            return
+                        raise
 
             if not self.running:
                 break
 
-            # ── Fase 3: Leer tickers y filtrar ───────────────────────────
-            all_tickers: Dict[str, dict] = {}
-            try:
-                if self.price_cache:
-                    all_tickers = self.price_cache.get_all_tickers()
-            except Exception:
-                pass
-
-            # Refrescar open_syms por si cambió durante la espera
-            open_syms = set(self._open_position_symbols())
-
-            tickers_received = len(all_tickers)
+            # ── Fase 4: Filtrar con los tickers acumulados ────────────────
+            open_syms        = set(self._open_position_symbols())  # refrescar
+            tickers_received = len(all_tickers_collected)
             filtered_entries: List[dict] = []
 
             for sym in symbols_to_scan:
-                ticker  = all_tickers.get(sym)
+                ticker  = all_tickers_collected.get(sym)
                 in_open = sym in open_syms
 
                 change = 0.0
@@ -737,23 +774,23 @@ class TradingBot:
             filtered_entries.sort(key=lambda x: x["change"], reverse=True)
             filtered_symbols = [e["symbol"] for e in filtered_entries]
 
-            n_filtered     = len(filtered_entries)
-            n_by_gain      = sum(1 for e in filtered_entries if e["change"] >= MIN_GAIN_FILTER)
-            n_by_pos       = len(open_syms)
-            top_info       = (
+            n_filtered = len(filtered_entries)
+            n_by_gain  = sum(1 for e in filtered_entries if e["change"] >= MIN_GAIN_FILTER)
+            n_by_pos   = len(open_syms)
+            top_info   = (
                 f"{filtered_entries[0]['symbol']} {filtered_entries[0]['change']:.1f}%"
                 if filtered_entries else "ninguno"
             )
 
             self.log(
-                f"[filter_cycle] {tickers_received}/{len(symbols_to_scan)} tickers | "
+                f"[filter_cycle] {tickers_received}/{n_total} tickers recibidos | "
                 f"{n_filtered} clasificados: "
                 f">={MIN_GAIN_FILTER:.0f}%={n_by_gain}, posiciones={n_by_pos} | "
                 f"top={top_info}"
             )
 
-            # ── Fase 4: Reiniciar WS con lista filtrada (desuscribir resto) ─
-            # Si no hay ningún símbolo (mercado plano), suscribir mínimo para no quedarse ciego
+            # ── Fase 5: Iniciar WS permanente solo con los filtrados ──────
+            # Si no hay ningún clasificado (mercado plano), mantener mínimo
             active_list = filtered_symbols if filtered_symbols else (
                 list(open_syms) or self.all_symbols[:10]
             )
@@ -761,7 +798,7 @@ class TradingBot:
             await asyncio.to_thread(self._start_price_cache, active_list)
             await asyncio.to_thread(self._start_kline_cache,  active_list)
 
-            # ── Fase 5: Actualizar winners y métricas ─────────────────────
+            # ── Fase 6: Actualizar winners y métricas ─────────────────────
             with self.lock:
                 self.winners              = filtered_entries
                 self.subscribed_symbols   = list(active_list)
