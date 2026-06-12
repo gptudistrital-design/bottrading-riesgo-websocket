@@ -317,6 +317,8 @@ class TradingBot:
         # ── WS caches ─────────────────────────────────────────────────────
         self.price_cache:        Optional[SymbolWebSocketPriceCache] = None
         self.kline_cache:        Optional[KlineWebSocketCache]       = None
+        self.price_subscribed_symbols: List[str] = []
+        self.kline_subscribed_symbols: List[str] = []
         self.subscribed_symbols: List[str] = []
 
         # ── Métricas ──────────────────────────────────────────────────────
@@ -438,6 +440,9 @@ class TradingBot:
                 pass
             time.sleep(WS_STOP_GRACE)
             self.price_cache = None
+        with self.lock:
+            self.price_subscribed_symbols = []
+            self.subscribed_symbols = []
 
     def _stop_kline_cache(self) -> None:
         if self.kline_cache:
@@ -447,6 +452,8 @@ class TradingBot:
                 pass
             time.sleep(WS_STOP_GRACE)
             self.kline_cache = None
+        with self.lock:
+            self.kline_subscribed_symbols = []
 
     def _open_position_symbols(self) -> List[str]:
         with self.lock:
@@ -457,7 +464,7 @@ class TradingBot:
 
     def _start_price_cache(self, symbols: List[str]) -> None:
         normalized = [s.upper() for s in symbols]
-        if self.price_cache and self.subscribed_symbols == normalized:
+        if self.price_cache and self.price_subscribed_symbols == normalized:
             return
         self._stop_price_cache()
         if not normalized:
@@ -467,11 +474,16 @@ class TradingBot:
             symbols_per_connection=30,
         )
         self.price_cache.start()
+        with self.lock:
+            self.price_subscribed_symbols = list(normalized)
+            # La UI debe reflejar inmediatamente la suscripción WS activa,
+            # incluso durante la ventana sub ALL antes del filtrado.
+            self.subscribed_symbols = list(normalized)
         self.log(f"PriceCache iniciado con {len(normalized)} símbolos (markPrice + @ticker)")
 
     def _start_kline_cache(self, symbols: List[str]) -> None:
         normalized = [s.upper() for s in symbols]
-        if self.kline_cache and self.subscribed_symbols == normalized:
+        if self.kline_cache and self.kline_subscribed_symbols == normalized:
             return
         self._stop_kline_cache()
         if not normalized:
@@ -490,6 +502,8 @@ class TradingBot:
             safety_refresh_interval_seconds = 1500,
         )
         self.kline_cache.start()
+        with self.lock:
+            self.kline_subscribed_symbols = list(normalized)
         self.log(f"KlineCache iniciado con {len(normalized)} símbolos (1m)")
 
     # ── Caché de símbolos en disco ─────────────────────────────────────────────
@@ -1129,6 +1143,7 @@ class TradingBot:
             filter_cycle_count = self.filter_cycle_count
             last_filter_at     = self.last_filter_cycle_at
             all_symbols_count  = len(self.all_symbols)
+            subscribed_snap    = list(self.subscribed_symbols)
 
         now = time.time()
 
@@ -1216,9 +1231,9 @@ class TradingBot:
             "full_subscribe_wait":  FULL_SUBSCRIBE_WAIT_SECS,
             # Símbolos
             "all_symbols_count":    all_symbols_count,
-            "subscribed_count":     len(self.subscribed_symbols),
-            "subscribed_symbols":   self.subscribed_symbols[:25],
-            "subscribed_symbols_truncated": len(self.subscribed_symbols) > 25,
+            "subscribed_count":     len(subscribed_snap),
+            "subscribed_symbols":   subscribed_snap,
+            "subscribed_symbols_truncated": False,
             # WS ticker (actualizaciones entre ciclos)
             "last_ws_ticker_text":  last_ws_ticker_text,
             "ws_ticker_updates":    ws_ticker_updates,
@@ -1360,16 +1375,8 @@ class TradingBot:
         if not isinstance(live, dict) or not live:
             live = self._build_snapshot()
 
-        if not live.get("positions") and not live.get("winners") and os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, "r", encoding="utf-8") as fh:
-                    persisted = json.load(fh)
-                if isinstance(persisted, dict) and \
-                   persisted.get("scan_count", 0) > live.get("scan_count", 0):
-                    persisted["state_source"] = "persisted"
-                    return persisted
-            except Exception:
-                pass
+        # No devolver STATE_FILE mientras el bot corre: puede tener scan_count antiguo
+        # más alto que el proceso actual y congelar la UI con precios/ranking obsoletos.
         live["state_source"] = "memory"
         return live
 
@@ -1459,6 +1466,7 @@ HTML = r"""<!doctype html>
                   display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; }
     .filter-bar span { color: var(--muted); }
     .filter-bar b   { color: var(--purple); }
+    .subscribed-list { margin-top: 10px; max-height: 92px; overflow: auto; }
   </style>
 </head>
 <body>
@@ -1517,6 +1525,8 @@ HTML = r"""<!doctype html>
          quedan <b id="fbFiltered">—</b> (≥<b id="fbThreshold">—</b>% o posición abierta) →
          unsub <b id="fbUnsub">—</b></div>
     <div>⏱ Próximo: <b id="fbNext" style="color:var(--yellow)">—</b></div>
+    <div style="flex-basis:100%;color:var(--muted)">Suscritos ahora:</div>
+    <div id="subscribedList" class="subscribed-list" style="flex-basis:100%">—</div>
   </div>
 
   <!-- WS status -->
@@ -1719,6 +1729,14 @@ function render(d) {
   q('fbUnsub').textContent     = Math.max(0, allCount - subCount);
   q('gainThreshold').textContent = threshold;
   q('fbNext').textContent      = d.next_filter_text || '—';
+  const subscribedSymbols = Array.isArray(d.subscribed_symbols) ? d.subscribed_symbols : [];
+  const visibleSubscribed = subscribedSymbols.slice(0, 120);
+  q('subscribedList').innerHTML = visibleSubscribed.length
+    ? visibleSubscribed.map(sym => `<span class="pill">${sym}</span>`).join('') +
+      (subscribedSymbols.length > visibleSubscribed.length
+        ? `<span class="pill">+${subscribedSymbols.length - visibleSubscribed.length} más</span>`
+        : '')
+    : '<span style="color:var(--muted)">Esperando suscripción WS…</span>';
 
   // Parpadeo del ciclo de filtrado
   const fc = n(d.filter_cycle_count);
