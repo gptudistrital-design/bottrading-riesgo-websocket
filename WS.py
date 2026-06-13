@@ -50,7 +50,16 @@ class SymbolWebSocketPriceCache:
     _WS_MAX_SIZE  = 131_072   # 128 KB — con 570 símbolos los msgs siguen siendo < 2 KB c/u
     _WS_MAX_QUEUE = 64        # cola pequeña; se procesa en tiempo real
 
-    def __init__(self, symbols: list[str]):
+    def __init__(self, symbols: list[str], symbols_per_connection: int | None = None):
+        # symbols_per_connection se mantiene por compatibilidad con código existente.
+        # Ya no se usa: con el límite de 1024 streams de Binance, todos los símbolos
+        # caben en 1 conexión por tipo de stream (markPrice + ticker = 2 conexiones total).
+        if symbols_per_connection is not None:
+            print(
+                f"[WS] ⚠️  symbols_per_connection={symbols_per_connection} ignorado — "
+                f"todos los símbolos van en 1 conexión por stream (límite Binance: 1024)."
+            )
+
         self.symbols = [s.upper() for s in symbols]
 
         if len(self.symbols) > _BINANCE_MAX_STREAMS:
