@@ -523,16 +523,16 @@ class TradingBot:
         # Cargar lista completa de símbolos (caché en disco o REST)
         await self._init_all_symbols()
 
-        await asyncio.gather(
-            self._supervised(self._all_symbols_refresh_loop,  "_all_symbols_refresh_loop"),
-            self._supervised(self._filter_cycle_loop,          "_filter_cycle_loop"),
-            self._supervised(self._ws_ticker_update_loop,      "_ws_ticker_update_loop"),
-            self._supervised(self._scanner,                    "_scanner"),
-            self._supervised(self._realtime_price_loop,        "_realtime_price_loop"),
-            self._supervised(self._snapshot_loop,              "_snapshot_loop"),
-            self._supervised(self._persist_state_loop,         "_persist_state_loop"),
-            return_exceptions=True,
-        )
+        tasks = [
+            asyncio.create_task(self._supervised(self._all_symbols_refresh_loop,  "_all_symbols_refresh_loop")),
+            asyncio.create_task(self._supervised(self._filter_cycle_loop,          "_filter_cycle_loop")),
+            asyncio.create_task(self._supervised(self._ws_ticker_update_loop,      "_ws_ticker_update_loop")),
+            asyncio.create_task(self._supervised(self._scanner,                    "_scanner")),
+            asyncio.create_task(self._supervised(self._realtime_price_loop,        "_realtime_price_loop")),
+            asyncio.create_task(self._supervised(self._snapshot_loop,              "_snapshot_loop")),
+            asyncio.create_task(self._supervised(self._persist_state_loop,         "_persist_state_loop")),
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     # ── Gestión de WS caches ──────────────────────────────────────────────────
 
@@ -1611,6 +1611,69 @@ class TradingBot:
             },
             "ts": now,
         }
+
+
+    def _write_state_file(self, snap: dict) -> None:
+        '''Escribe el estado en disco de forma atómica.'''
+        if not snap["positions"] and not snap["closed_trades"] and snap["scan_count"] <= 0:
+            return
+
+        tmp = f"{STATE_FILE}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(snap, fh, ensure_ascii=False, default=str)
+            os.replace(tmp, STATE_FILE)
+        except Exception as exc:
+            self.log(f"No pude persistir estado: {exc}")
+
+    async def _persist_state_loop(self) -> None:
+        '''Flusher en segundo plano para persistir estado sin bloquear el loop.'''
+        if self._persist_event is None:
+            self._persist_event = asyncio.Event()
+
+        while self.running:
+            try:
+                await self._persist_event.wait()
+                self._persist_event.clear()
+
+                # Debounce: agrupa ráfagas de cambios consecutivos.
+                try:
+                    await asyncio.sleep(self._persist_debounce_secs)
+                except asyncio.CancelledError:
+                    if not self.running:
+                        break
+                    raise
+
+                while self._persist_event.is_set():
+                    self._persist_event.clear()
+                    try:
+                        await asyncio.sleep(self._persist_debounce_secs)
+                    except asyncio.CancelledError:
+                        if not self.running:
+                            break
+                        raise
+
+                if not self.running:
+                    break
+
+                snap = self._build_snapshot()
+                if not snap["positions"] and not snap["closed_trades"] and snap["scan_count"] <= 0:
+                    continue
+
+                await asyncio.to_thread(self._write_state_file, snap)
+
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log(f"No pude persistir estado en background: {exc}")
+                try:
+                    await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    if not self.running:
+                        break
+                    raise
 
     # ── Persistencia ──────────────────────────────────────────────────────────
 
