@@ -34,10 +34,10 @@ from dataclasses import dataclass as _dataclass_eb
 @_dataclass_eb
 class _ExecutorSignalConfig:
     executor_url:   str = ""
-    signal_secret:  str = "clave-secreta-aleatoria"
-    poll_secs:      int = 5
-    timeout_signal: int = 8
-    timeout_state:  int = 8
+    signal_secret:   str = "clave-secreta-aleatoria"
+    poll_secs:       int = 5
+    timeout_signal:  int = 8
+    timeout_state:   int = 8
 
 
 class ExecutorBridge:
@@ -83,12 +83,18 @@ class ExecutorBridge:
             req = self._build_signal_request(payload)
             with urllib.request.urlopen(req, timeout=self.config.timeout_signal) as resp:
                 resp.read()
-                self._log(f"[executor] ✓ señal enviada: {payload.get('action')} {payload.get('symbol')}")
+                self._log(
+                    f"[executor] ✓ señal enviada: {payload.get('action')} {payload.get('symbol')}"
+                )
         except Exception as exc:
             self._log(
                 f"[executor] error enviando {payload.get('action')} "
                 f"{payload.get('symbol')}: {exc}"
             )
+
+    async def send_signal_async(self, payload: dict) -> None:
+        """Versión no bloqueante para usar desde el event loop."""
+        await asyncio.to_thread(self.send_signal_sync, payload)
 
     def fetch_state_sync(self) -> Optional[dict]:
         """Lee /api/state del Executor."""
@@ -113,8 +119,8 @@ class ExecutorBridge:
         notional: float = 0.0,
         level: float = 0.0,
     ) -> None:
-        """Notifica apertura de posición al Executor."""
-        self.send_signal_sync({
+        """Notifica apertura de posición al Executor sin bloquear el loop."""
+        payload = {
             "action":    "open",
             "trade_id":  trade_id,
             "symbol":    symbol,
@@ -123,7 +129,8 @@ class ExecutorBridge:
             "quantity":  quantity,
             "notional":  notional,
             "level":     level,
-        })
+        }
+        self.notify_async(payload)
 
     def notify_close(
         self,
@@ -134,8 +141,8 @@ class ExecutorBridge:
         close_price: float,
         pnl: float = 0.0,
     ) -> None:
-        """Notifica cierre de posición al Executor."""
-        self.send_signal_sync({
+        """Notifica cierre de posición al Executor sin bloquear el loop."""
+        payload = {
             "action":      "close",
             "trade_id":    trade_id,
             "symbol":      symbol,
@@ -143,16 +150,23 @@ class ExecutorBridge:
             "reason":      reason,
             "close_price": close_price,
             "pnl":         pnl,
-        })
+        }
+        self.notify_async(payload)
 
     def notify_async(self, payload: dict) -> None:
-        """Dispara el envío sin bloquear (solo si hay loop asyncio activo)."""
+        """Dispara el envío sin bloquear el event loop."""
         if not self.config.executor_url:
             return
         try:
-            asyncio.create_task(asyncio.to_thread(self.send_signal_sync, payload))
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            pass
+            threading.Thread(
+                target=self.send_signal_sync,
+                args=(payload,),
+                daemon=True,
+            ).start()
+            return
+        loop.create_task(self.send_signal_async(payload))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -399,6 +413,13 @@ class TradingBot:
         self.loop:   Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
 
+        # ── Persistencia asíncrona ────────────────────────────────────────
+        self._persist_event: Optional[asyncio.Event] = None
+        self._persist_debounce_secs: float = 0.35
+
+        # ── Guardia anti doble cierre ─────────────────────────────────────
+        self._closing_symbols: set[str] = set()
+
         # ── Executor bridge ───────────────────────────────────────────────
         self._trade_id_seq: int = 0
         self.executor = ExecutorBridge(
@@ -437,6 +458,7 @@ class TradingBot:
     def _run_loop(self) -> None:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+        self._persist_event = asyncio.Event()
         try:
             self.loop.run_until_complete(self._main())
         except Exception as exc:
@@ -508,6 +530,7 @@ class TradingBot:
             self._supervised(self._scanner,                    "_scanner"),
             self._supervised(self._realtime_price_loop,        "_realtime_price_loop"),
             self._supervised(self._snapshot_loop,              "_snapshot_loop"),
+            self._supervised(self._persist_state_loop,         "_persist_state_loop"),
             return_exceptions=True,
         )
 
@@ -1144,6 +1167,21 @@ class TradingBot:
                 if not self.running:
                     break
 
+    def _begin_close_guard(self, symbol: str) -> bool:
+        """Evita cierres duplicados del mismo símbolo."""
+        with self.lock:
+            if symbol in self._closing_symbols:
+                return False
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.fills:
+                return False
+            self._closing_symbols.add(symbol)
+            return True
+
+    def _end_close_guard(self, symbol: str) -> None:
+        with self.lock:
+            self._closing_symbols.discard(symbol)
+
     # ── Estrategia ────────────────────────────────────────────────────────────
 
     async def _ensure_short(self, symbol: str, level: float, notional: float,
@@ -1158,6 +1196,8 @@ class TradingBot:
                 return
 
             if self._cooldown_remaining(symbol) > 0:
+                return
+            if symbol in self._closing_symbols:
                 return
             pos = self.positions.setdefault(symbol, BotPosition(symbol=symbol))
             if level in pos.opened_levels() or pos.status != "OPEN":
@@ -1195,206 +1235,219 @@ class TradingBot:
             self.log(f"Error abriendo short {symbol} nivel {level}: {exc}")
 
     async def _maybe_take_profit(self, symbol: str, price: float) -> None:
-        with self.lock:
-            pos = self.positions.get(symbol)
-            if not pos or pos.status != "OPEN" or not pos.fills:
-                return
-            pnl      = pos.unrealized_pnl(price)
-            target   = pos.notional * TAKE_PROFIT_FRACTION
-            qty      = pos.qty
-            avg_ent  = pos.avg_entry
-            notional = pos.notional
-            trade_id = pos.trade_id
-
-        if pnl < target:
+        if not self._begin_close_guard(symbol):
             return
 
         try:
-            await self.client.close_short(symbol, qty)
-        except Exception as exc:
-            self.last_error = str(exc)
-            self.log(f"Error cerrando short {symbol}: {exc}")
-            return
+            with self.lock:
+                pos = self.positions.get(symbol)
+                if not pos or pos.status != "OPEN" or not pos.fills:
+                    return
+                pnl      = pos.unrealized_pnl(price)
+                target   = pos.notional * TAKE_PROFIT_FRACTION
+                qty      = pos.qty
+                avg_ent  = pos.avg_entry
+                notional = pos.notional
+                trade_id = pos.trade_id
 
-        unblock_str = ""
-        with self.lock:
-            pos = self.positions.pop(symbol, None)
-            if pos:
-                pos.status       = "CLOSED"
-                pos.realized_pnl = pnl
-                self.total_realized_pnl += pnl
+            if pnl < target:
+                return
 
-                unblock_ts  = time.time() + COOLDOWN_SECONDS
-                self.symbol_cooldown[symbol] = unblock_ts
-                unblock_str = datetime.fromtimestamp(
-                    unblock_ts, timezone.utc
-                ).strftime("%Y-%m-%d %H:%M UTC")
+            try:
+                await self.client.close_short(symbol, qty)
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log(f"Error cerrando short {symbol}: {exc}")
+                return
 
-                self.closed_trades.insert(0, {
-                    "symbol":      symbol,
-                    "pnl":         pnl,
-                    "target":      target,
-                    "qty":         qty,
-                    "avg_entry":   avg_ent,
-                    "close_price": price,
-                    "notional":    notional,
-                    "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                    "unblock_at":  unblock_str,
-                    "reason":      "TP",
-                })
-                self.closed_trades = self.closed_trades[:500]
+            unblock_str = ""
+            with self.lock:
+                pos = self.positions.pop(symbol, None)
+                if pos:
+                    pos.status       = "CLOSED"
+                    pos.realized_pnl = pnl
+                    self.total_realized_pnl += pnl
 
-        # Notificar cierre al Executor
-        self.executor.notify_close(
-            trade_id=trade_id,
-            symbol=symbol,
-            direction="SHORT",
-            reason="TP",
-            close_price=price,
-            pnl=pnl,
-        )
-        self.log(
-            f"CIERRE TP {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | "
-            f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
-        )
-        self.persist_state()
+                    unblock_ts  = time.time() + COOLDOWN_SECONDS
+                    self.symbol_cooldown[symbol] = unblock_ts
+                    unblock_str = datetime.fromtimestamp(
+                        unblock_ts, timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M UTC")
+
+                    self.closed_trades.insert(0, {
+                        "symbol":      symbol,
+                        "pnl":         pnl,
+                        "target":      target,
+                        "qty":         qty,
+                        "avg_entry":   avg_ent,
+                        "close_price": price,
+                        "notional":    notional,
+                        "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "unblock_at":  unblock_str,
+                        "reason":      "TP",
+                    })
+                    self.closed_trades = self.closed_trades[:500]
+
+            self.executor.notify_close(
+                trade_id=trade_id,
+                symbol=symbol,
+                direction="SHORT",
+                reason="TP",
+                close_price=price,
+                pnl=pnl,
+            )
+            self.log(
+                f"CIERRE TP {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | "
+                f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+            )
+            self.persist_state()
+        finally:
+            self._end_close_guard(symbol)
 
     async def _maybe_stop_loss(self, symbol: str, price: float) -> None:
         """Cierra la posición si la pérdida no realizada >= notional total (SL máximo)."""
-        with self.lock:
-            pos = self.positions.get(symbol)
-            if not pos or pos.status != "OPEN" or not pos.fills:
-                return
-            pnl      = pos.unrealized_pnl(price)
-            notional = pos.notional
-            # SL se activa cuando la pérdida iguala o supera el notional invertido
-            if pnl > -notional:
-                return
-            qty      = pos.qty
-            avg_ent  = pos.avg_entry
-            trade_id = pos.trade_id
-
-        try:
-            await self.client.close_short(symbol, qty)
-        except Exception as exc:
-            self.last_error = str(exc)
-            self.log(f"Error cerrando STOP LOSS {symbol}: {exc}")
+        if not self._begin_close_guard(symbol):
             return
 
-        unblock_str = ""
-        with self.lock:
-            pos = self.positions.pop(symbol, None)
-            if pos:
-                pos.status       = "CLOSED"
-                pos.realized_pnl = pnl
-                self.total_realized_pnl += pnl
+        try:
+            with self.lock:
+                pos = self.positions.get(symbol)
+                if not pos or pos.status != "OPEN" or not pos.fills:
+                    return
+                pnl      = pos.unrealized_pnl(price)
+                notional = pos.notional
+                if pnl > -notional:
+                    return
+                qty      = pos.qty
+                avg_ent  = pos.avg_entry
+                trade_id = pos.trade_id
 
-                unblock_ts  = time.time() + COOLDOWN_SECONDS
-                self.symbol_cooldown[symbol] = unblock_ts
-                unblock_str = datetime.fromtimestamp(
-                    unblock_ts, timezone.utc
-                ).strftime("%Y-%m-%d %H:%M UTC")
+            try:
+                await self.client.close_short(symbol, qty)
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log(f"Error cerrando STOP LOSS {symbol}: {exc}")
+                return
 
-                self.closed_trades.insert(0, {
-                    "symbol":      symbol,
-                    "pnl":         pnl,
-                    "target":      notional * TAKE_PROFIT_FRACTION,
-                    "qty":         qty,
-                    "avg_entry":   avg_ent,
-                    "close_price": price,
-                    "notional":    notional,
-                    "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                    "unblock_at":  unblock_str,
-                    "reason":      "SL",
-                })
-                self.closed_trades = self.closed_trades[:500]
+            unblock_str = ""
+            with self.lock:
+                pos = self.positions.pop(symbol, None)
+                if pos:
+                    pos.status       = "CLOSED"
+                    pos.realized_pnl = pnl
+                    self.total_realized_pnl += pnl
 
-        # Notificar cierre por SL al Executor
-        self.executor.notify_close(
-            trade_id=trade_id,
-            symbol=symbol,
-            direction="SHORT",
-            reason="SL",
-            close_price=price,
-            pnl=pnl,
-        )
-        self.log(
-            f"⛔ STOP LOSS {symbol}: PnL={pnl:.4f} | notional={notional:.4f} | "
-            f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
-        )
-        self.persist_state()
+                    unblock_ts  = time.time() + COOLDOWN_SECONDS
+                    self.symbol_cooldown[symbol] = unblock_ts
+                    unblock_str = datetime.fromtimestamp(
+                        unblock_ts, timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M UTC")
+
+                    self.closed_trades.insert(0, {
+                        "symbol":      symbol,
+                        "pnl":         pnl,
+                        "target":      notional * TAKE_PROFIT_FRACTION,
+                        "qty":         qty,
+                        "avg_entry":   avg_ent,
+                        "close_price": price,
+                        "notional":    notional,
+                        "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "unblock_at":  unblock_str,
+                        "reason":      "SL",
+                    })
+                    self.closed_trades = self.closed_trades[:500]
+
+            self.executor.notify_close(
+                trade_id=trade_id,
+                symbol=symbol,
+                direction="SHORT",
+                reason="SL",
+                close_price=price,
+                pnl=pnl,
+            )
+            self.log(
+                f"⛔ STOP LOSS {symbol}: PnL={pnl:.4f} | notional={notional:.4f} | "
+                f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+            )
+            self.persist_state()
+        finally:
+            self._end_close_guard(symbol)
 
     async def close_position_manual(self, symbol: str) -> bool:
         """Cierre manual de una posición abierta desde la UI."""
-        with self.lock:
-            pos = self.positions.get(symbol)
-            if not pos or pos.status != "OPEN" or not pos.fills:
-                return False
-            qty      = pos.qty
-            avg_ent  = pos.avg_entry
-            notional = pos.notional
-            trade_id = pos.trade_id
-
-        # Precio actual desde WS
-        price = 0.0
-        try:
-            if self.price_cache:
-                price = self.price_cache.get_all_prices().get(symbol, 0.0)
-        except Exception:
-            pass
-
-        try:
-            await self.client.close_short(symbol, qty)
-        except Exception as exc:
-            self.last_error = str(exc)
-            self.log(f"Error en cierre manual {symbol}: {exc}")
+        if not self._begin_close_guard(symbol):
             return False
 
-        pnl = 0.0
-        unblock_str = ""
-        with self.lock:
-            pos = self.positions.pop(symbol, None)
-            if pos:
-                pnl = pos.unrealized_pnl(price) if price > 0 else 0.0
-                pos.status       = "CLOSED"
-                pos.realized_pnl = pnl
-                self.total_realized_pnl += pnl
+        try:
+            with self.lock:
+                pos = self.positions.get(symbol)
+                if not pos or pos.status != "OPEN" or not pos.fills:
+                    return False
+                qty      = pos.qty
+                avg_ent  = pos.avg_entry
+                notional = pos.notional
+                trade_id = pos.trade_id
 
-                unblock_ts  = time.time() + COOLDOWN_SECONDS
-                self.symbol_cooldown[symbol] = unblock_ts
-                unblock_str = datetime.fromtimestamp(
-                    unblock_ts, timezone.utc
-                ).strftime("%Y-%m-%d %H:%M UTC")
+            price = 0.0
+            try:
+                if self.price_cache:
+                    price = self.price_cache.get_all_prices().get(symbol, 0.0)
+            except Exception:
+                pass
 
-                self.closed_trades.insert(0, {
-                    "symbol":      symbol,
-                    "pnl":         pnl,
-                    "target":      notional * TAKE_PROFIT_FRACTION,
-                    "qty":         qty,
-                    "avg_entry":   avg_ent,
-                    "close_price": price,
-                    "notional":    notional,
-                    "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                    "unblock_at":  unblock_str,
-                    "reason":      "MANUAL",
-                })
-                self.closed_trades = self.closed_trades[:500]
+            try:
+                await self.client.close_short(symbol, qty)
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log(f"Error en cierre manual {symbol}: {exc}")
+                return False
 
-        # Notificar cierre manual al Executor
-        self.executor.notify_close(
-            trade_id=trade_id,
-            symbol=symbol,
-            direction="SHORT",
-            reason="MANUAL",
-            close_price=price,
-            pnl=pnl,
-        )
-        self.log(
-            f"✋ CIERRE MANUAL {symbol}: PnL={pnl:.4f} | "
-            f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
-        )
-        self.persist_state()
-        return True
+            pnl = 0.0
+            unblock_str = ""
+            with self.lock:
+                pos = self.positions.pop(symbol, None)
+                if pos:
+                    pnl = pos.unrealized_pnl(price) if price > 0 else 0.0
+                    pos.status       = "CLOSED"
+                    pos.realized_pnl = pnl
+                    self.total_realized_pnl += pnl
+
+                    unblock_ts  = time.time() + COOLDOWN_SECONDS
+                    self.symbol_cooldown[symbol] = unblock_ts
+                    unblock_str = datetime.fromtimestamp(
+                        unblock_ts, timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M UTC")
+
+                    self.closed_trades.insert(0, {
+                        "symbol":      symbol,
+                        "pnl":         pnl,
+                        "target":      notional * TAKE_PROFIT_FRACTION,
+                        "qty":         qty,
+                        "avg_entry":   avg_ent,
+                        "close_price": price,
+                        "notional":    notional,
+                        "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "unblock_at":  unblock_str,
+                        "reason":      "MANUAL",
+                    })
+                    self.closed_trades = self.closed_trades[:500]
+
+            self.executor.notify_close(
+                trade_id=trade_id,
+                symbol=symbol,
+                direction="SHORT",
+                reason="MANUAL",
+                close_price=price,
+                pnl=pnl,
+            )
+            self.log(
+                f"✋ CIERRE MANUAL {symbol}: PnL={pnl:.4f} | "
+                f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+            )
+            self.persist_state()
+            return True
+        finally:
+            self._end_close_guard(symbol)
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
@@ -1562,16 +1615,20 @@ class TradingBot:
     # ── Persistencia ──────────────────────────────────────────────────────────
 
     def persist_state(self) -> None:
-        snap = self._build_snapshot()
-        if not snap["positions"] and not snap["closed_trades"] and snap["scan_count"] <= 0:
+        """Solicita persistencia asíncrona del estado sin bloquear el loop."""
+        if self._persist_event is None:
+            snap = self._build_snapshot()
+            self._write_state_file(snap)
             return
-        tmp = f"{STATE_FILE}.tmp"
+
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(snap, fh, ensure_ascii=False, default=str)
-            os.replace(tmp, STATE_FILE)
-        except Exception as exc:
-            self.log(f"No pude persistir estado: {exc}")
+            if self.loop and self.loop.is_running():
+                self.loop.call_soon_threadsafe(self._persist_event.set)
+            else:
+                self._persist_event.set()
+        except Exception:
+            snap = self._build_snapshot()
+            self._write_state_file(snap)
 
     def snapshot(self) -> dict:
         live = self._build_snapshot()
