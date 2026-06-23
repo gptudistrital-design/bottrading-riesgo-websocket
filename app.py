@@ -1,63 +1,4 @@
-"""
-Bot web para shortear ganadores de Binance Futures.
-
-ARQUITECTURA:
-════════════════════════════════════════════════════════════════════════════
- 1. REST inicial → /fapi/v1/exchangeInfo
-      Obtiene TODOS los símbolos USDT-M perpetuos.
-      Guarda la lista en SYMBOLS_CACHE_FILE como respaldo ante bloqueos.
-      Si el REST falla, carga desde ese caché guardado.
-
- 2. Refresh de lista completa cada SYMBOL_REFRESH_HOURS (12 h):
-      Actualiza all_symbols vía REST y regenera el caché.
-      Si Binance bloquea la IP, el caché anterior sigue siendo válido.
-
- 3. Ciclo de filtrado cada FILTER_CYCLE_SECS (5 min):
-      a. Suscribe TODOS los símbolos al WS (markPrice + @ticker 24h)
-      b. Espera FULL_SUBSCRIBE_WAIT_SECS (30 s) para recibir datos de ticker
-      c. Filtra: conserva solo cambio >= MIN_GAIN_FILTER (15%) O posición abierta
-      d. DESUSCRIBE el resto → reinicia WS únicamente con la lista filtrada
-      e. Actualiza self.winners con los símbolos activos
-
- 4. _ws_ticker_update_loop (cada WS_TICKER_UPDATE_SECS = 5 s):
-      Entre ciclos de filtrado, actualiza self.winners con los datos
-      frescos del @ticker de los símbolos actualmente suscritos.
-
- 5. KlineWebSocketCache → klines 1m para confirmación técnica de entrada.
-
- 6. Scanner (cada SCAN_INTERVAL_SECS):
-      Lee precio WS + klines + change WS, aplica niveles 50/75/100/150/200/250%.
-
- 7. Realtime TP loop (cada 0.25 s):
-      Cierra posiciones cuando PnL >= objetivo usando precios WS.
-
- 8. fetch() polling → /api/status cada 2 s. Actualiza el DOM sin recargar.
-
- 9. Cooldown 24 h tras cierre ganador.
-
-FLUJO DE DATOS:
-  Startup ──► REST exchangeInfo (all symbols) ──► guardar caché
-                  │
-                  ▼
-     _filter_cycle_loop (cada 5 min)
-       ├─ sub ALL symbols → espera 30s → leer ticker_cache
-       ├─ filtrar: change >= 15% OR posición abierta
-       ├─ desuscribir el resto (restart WS con lista reducida)
-       └─ actualizar self.winners
-
-     _ws_ticker_update_loop (cada 5 s)
-       └─ mantiene self.winners actualizado entre ciclos de filtrado
-
-ROBUSTEZ:
-  - Caché de símbolos en disco: si Binance bloquea, se usan los guardados
-  - asyncio.gather con return_exceptions=True
-  - Supervisor (_supervised) relanza cualquier coro que muera inesperadamente
-  - HTTP 418 capturado y logueado sin crashear
-════════════════════════════════════════════════════════════════════════════
-"""
-
 from __future__ import annotations
-
 import asyncio
 import hashlib
 import hmac
@@ -75,7 +16,7 @@ from urllib.parse import urlencode
 import urllib.error
 import urllib.request
 
-from flask import Flask, jsonify, make_response, render_template_string
+from flask import Flask, jsonify, make_response, render_template_string, request
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -83,6 +24,135 @@ if _HERE not in sys.path:
 
 from WS import SymbolWebSocketPriceCache                    # noqa: E402
 from KlineWebSocketCache_v4 import KlineWebSocketCache      # noqa: E402
+
+# ── ExecutorBridge (señales al Executor externo) ─────────────────────────────
+import urllib.error
+import urllib.request
+from dataclasses import dataclass as _dataclass_eb
+
+
+@_dataclass_eb
+class _ExecutorSignalConfig:
+    executor_url:   str = ""
+    signal_secret:  str = "clave-secreta-aleatoria"
+    poll_secs:      int = 5
+    timeout_signal: int = 8
+    timeout_state:  int = 8
+
+
+class ExecutorBridge:
+    """Envía señales de apertura/cierre al Executor y consulta su estado."""
+
+    def __init__(
+        self,
+        executor_url: str = "",
+        signal_secret: str = "clave-secreta-aleatoria",
+        poll_secs: int = 5,
+        logger=None,
+    ) -> None:
+        self.config = _ExecutorSignalConfig(
+            executor_url=executor_url.strip().rstrip("/"),
+            signal_secret=signal_secret,
+            poll_secs=int(poll_secs),
+        )
+        self.logger = logger or print
+
+    def _log(self, message: str) -> None:
+        try:
+            self.logger(message)
+        except Exception:
+            pass
+
+    def _build_signal_request(self, payload: dict) -> urllib.request.Request:
+        body = json.dumps(payload).encode("utf-8")
+        return urllib.request.Request(
+            f"{self.config.executor_url}/signal",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Signal-Secret": self.config.signal_secret,
+            },
+            method="POST",
+        )
+
+    def send_signal_sync(self, payload: dict) -> None:
+        """Envía una señal al Executor. No lanza excepción: solo registra el error."""
+        if not self.config.executor_url:
+            return
+        try:
+            req = self._build_signal_request(payload)
+            with urllib.request.urlopen(req, timeout=self.config.timeout_signal) as resp:
+                resp.read()
+                self._log(f"[executor] ✓ señal enviada: {payload.get('action')} {payload.get('symbol')}")
+        except Exception as exc:
+            self._log(
+                f"[executor] error enviando {payload.get('action')} "
+                f"{payload.get('symbol')}: {exc}"
+            )
+
+    def fetch_state_sync(self) -> Optional[dict]:
+        """Lee /api/state del Executor."""
+        if not self.config.executor_url:
+            return None
+        try:
+            req = urllib.request.Request(
+                f"{self.config.executor_url}/api/state", method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=self.config.timeout_state) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    def notify_open(
+        self,
+        trade_id: int,
+        symbol: str,
+        direction: str,
+        price: float,
+        quantity: float,
+        notional: float = 0.0,
+        level: float = 0.0,
+    ) -> None:
+        """Notifica apertura de posición al Executor."""
+        self.send_signal_sync({
+            "action":    "open",
+            "trade_id":  trade_id,
+            "symbol":    symbol,
+            "direction": direction,
+            "price":     price,
+            "quantity":  quantity,
+            "notional":  notional,
+            "level":     level,
+        })
+
+    def notify_close(
+        self,
+        trade_id: int,
+        symbol: str,
+        direction: str,
+        reason: str,
+        close_price: float,
+        pnl: float = 0.0,
+    ) -> None:
+        """Notifica cierre de posición al Executor."""
+        self.send_signal_sync({
+            "action":      "close",
+            "trade_id":    trade_id,
+            "symbol":      symbol,
+            "direction":   direction,
+            "reason":      reason,
+            "close_price": close_price,
+            "pnl":         pnl,
+        })
+
+    def notify_async(self, payload: dict) -> None:
+        """Dispara el envío sin bloquear (solo si hay loop asyncio activo)."""
+        if not self.config.executor_url:
+            return
+        try:
+            asyncio.create_task(asyncio.to_thread(self.send_signal_sync, payload))
+        except RuntimeError:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,6 +206,10 @@ ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
 TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
 
+# ── Executor externo ──────────────────────────────────────────────────────────
+EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "")
+EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODELOS DE DATOS
@@ -156,6 +230,7 @@ class BotPosition:
     fills:        List[Fill] = field(default_factory=list)
     realized_pnl: float = 0.0
     status:       str   = "OPEN"
+    trade_id:     int   = 0
 
     @property
     def qty(self) -> float:
@@ -324,6 +399,15 @@ class TradingBot:
         self.loop:   Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
 
+        # ── Executor bridge ───────────────────────────────────────────────
+        self._trade_id_seq: int = 0
+        self.executor = ExecutorBridge(
+            executor_url=EXECUTOR_URL,
+            signal_secret=EXECUTOR_SECRET,
+        )
+        # total PnL realizado acumulado (suma de todos los cierres)
+        self.total_realized_pnl: float = 0.0
+
     # ── Logging ───────────────────────────────────────────────────────────────
 
     def log(self, msg: str) -> None:
@@ -389,7 +473,20 @@ class TradingBot:
 
     # ── Main ──────────────────────────────────────────────────────────────────
 
+    def _next_trade_id(self) -> int:
+        """Genera un trade_id único e incremental (thread-safe)."""
+        with self.lock:
+            self._trade_id_seq += 1
+            return self._trade_id_seq
+
     async def _main(self) -> None:
+        # Conectar el logger del executor al sistema de log del bot
+        self.executor.logger = self.log
+        if EXECUTOR_URL:
+            self.log(f"[executor] Bridge configurado → {EXECUTOR_URL}")
+        else:
+            self.log("[executor] EXECUTOR_URL no configurado — señales desactivadas")
+
         self.log("Bot iniciado — modo " + (
             "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL"
         ))
@@ -955,9 +1052,10 @@ class TradingBot:
                         if change >= level and kline_ok:
                             await self._ensure_short(symbol, level, notional, price, change)
 
+                    await self._maybe_stop_loss(symbol, price)
                     await self._maybe_take_profit(symbol, price)
 
-                # TP de posiciones que ya no están en winners
+                # TP/SL de posiciones que ya no están en winners
                 with self.lock:
                     pos_syms = list(self.positions.keys())
                 winner_syms = {w["symbol"] for w in winners}
@@ -965,6 +1063,7 @@ class TradingBot:
                     if symbol not in winner_syms:
                         price = all_prices.get(symbol)
                         if price:
+                            await self._maybe_stop_loss(symbol, price)
                             await self._maybe_take_profit(symbol, price)
 
                 with self.lock:
@@ -1003,7 +1102,7 @@ class TradingBot:
     # ── Realtime TP loop ──────────────────────────────────────────────────────
 
     async def _realtime_price_loop(self) -> None:
-        """Comprueba TP cada 0.25 s usando precios markPrice WS."""
+        """Comprueba TP y SL cada 0.25 s usando precios markPrice WS."""
         while self.running:
             try:
                 if self.price_cache and self.positions:
@@ -1013,6 +1112,7 @@ class TradingBot:
                     for symbol in pos_syms:
                         price = all_prices.get(symbol)
                         if price and price > 0:
+                            await self._maybe_stop_loss(symbol, price)
                             await self._maybe_take_profit(symbol, price)
             except asyncio.CancelledError:
                 if not self.running:
@@ -1062,6 +1162,10 @@ class TradingBot:
             pos = self.positions.setdefault(symbol, BotPosition(symbol=symbol))
             if level in pos.opened_levels() or pos.status != "OPEN":
                 return
+            # Asignar trade_id la primera vez que se abre la posición
+            if pos.trade_id == 0:
+                pos.trade_id = self._next_trade_id()
+            trade_id = pos.trade_id
 
         try:
             if should_log:
@@ -1073,7 +1177,17 @@ class TradingBot:
                 self.positions[symbol].fills.append(fill)
             self.log(
                 f"SHORT {symbol}: nivel {level:.0f}% | {notional:.2f} USDT | "
-                f"qty={qty} | px={price:.6f} | cambio(WS)={change:.2f}%"
+                f"qty={qty} | px={price:.6f} | cambio(WS)={change:.2f}% | trade_id={trade_id}"
+            )
+            # Notificar apertura al Executor
+            self.executor.notify_open(
+                trade_id=trade_id,
+                symbol=symbol,
+                direction="SHORT",
+                price=price,
+                quantity=qty,
+                notional=notional,
+                level=level,
             )
             self.persist_state()
         except Exception as exc:
@@ -1090,6 +1204,7 @@ class TradingBot:
             qty      = pos.qty
             avg_ent  = pos.avg_entry
             notional = pos.notional
+            trade_id = pos.trade_id
 
         if pnl < target:
             return
@@ -1101,11 +1216,13 @@ class TradingBot:
             self.log(f"Error cerrando short {symbol}: {exc}")
             return
 
+        unblock_str = ""
         with self.lock:
             pos = self.positions.pop(symbol, None)
             if pos:
                 pos.status       = "CLOSED"
                 pos.realized_pnl = pnl
+                self.total_realized_pnl += pnl
 
                 unblock_ts  = time.time() + COOLDOWN_SECONDS
                 self.symbol_cooldown[symbol] = unblock_ts
@@ -1123,14 +1240,161 @@ class TradingBot:
                     "notional":    notional,
                     "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                     "unblock_at":  unblock_str,
+                    "reason":      "TP",
                 })
-                self.closed_trades = self.closed_trades[:100]
+                self.closed_trades = self.closed_trades[:500]
 
+        # Notificar cierre al Executor
+        self.executor.notify_close(
+            trade_id=trade_id,
+            symbol=symbol,
+            direction="SHORT",
+            reason="TP",
+            close_price=price,
+            pnl=pnl,
+        )
         self.log(
-            f"CIERRE {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | "
+            f"CIERRE TP {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | "
             f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
         )
         self.persist_state()
+
+    async def _maybe_stop_loss(self, symbol: str, price: float) -> None:
+        """Cierra la posición si la pérdida no realizada >= notional total (SL máximo)."""
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.fills:
+                return
+            pnl      = pos.unrealized_pnl(price)
+            notional = pos.notional
+            # SL se activa cuando la pérdida iguala o supera el notional invertido
+            if pnl > -notional:
+                return
+            qty      = pos.qty
+            avg_ent  = pos.avg_entry
+            trade_id = pos.trade_id
+
+        try:
+            await self.client.close_short(symbol, qty)
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.log(f"Error cerrando STOP LOSS {symbol}: {exc}")
+            return
+
+        unblock_str = ""
+        with self.lock:
+            pos = self.positions.pop(symbol, None)
+            if pos:
+                pos.status       = "CLOSED"
+                pos.realized_pnl = pnl
+                self.total_realized_pnl += pnl
+
+                unblock_ts  = time.time() + COOLDOWN_SECONDS
+                self.symbol_cooldown[symbol] = unblock_ts
+                unblock_str = datetime.fromtimestamp(
+                    unblock_ts, timezone.utc
+                ).strftime("%Y-%m-%d %H:%M UTC")
+
+                self.closed_trades.insert(0, {
+                    "symbol":      symbol,
+                    "pnl":         pnl,
+                    "target":      notional * TAKE_PROFIT_FRACTION,
+                    "qty":         qty,
+                    "avg_entry":   avg_ent,
+                    "close_price": price,
+                    "notional":    notional,
+                    "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "unblock_at":  unblock_str,
+                    "reason":      "SL",
+                })
+                self.closed_trades = self.closed_trades[:500]
+
+        # Notificar cierre por SL al Executor
+        self.executor.notify_close(
+            trade_id=trade_id,
+            symbol=symbol,
+            direction="SHORT",
+            reason="SL",
+            close_price=price,
+            pnl=pnl,
+        )
+        self.log(
+            f"⛔ STOP LOSS {symbol}: PnL={pnl:.4f} | notional={notional:.4f} | "
+            f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+        )
+        self.persist_state()
+
+    async def close_position_manual(self, symbol: str) -> bool:
+        """Cierre manual de una posición abierta desde la UI."""
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.fills:
+                return False
+            qty      = pos.qty
+            avg_ent  = pos.avg_entry
+            notional = pos.notional
+            trade_id = pos.trade_id
+
+        # Precio actual desde WS
+        price = 0.0
+        try:
+            if self.price_cache:
+                price = self.price_cache.get_all_prices().get(symbol, 0.0)
+        except Exception:
+            pass
+
+        try:
+            await self.client.close_short(symbol, qty)
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.log(f"Error en cierre manual {symbol}: {exc}")
+            return False
+
+        pnl = 0.0
+        unblock_str = ""
+        with self.lock:
+            pos = self.positions.pop(symbol, None)
+            if pos:
+                pnl = pos.unrealized_pnl(price) if price > 0 else 0.0
+                pos.status       = "CLOSED"
+                pos.realized_pnl = pnl
+                self.total_realized_pnl += pnl
+
+                unblock_ts  = time.time() + COOLDOWN_SECONDS
+                self.symbol_cooldown[symbol] = unblock_ts
+                unblock_str = datetime.fromtimestamp(
+                    unblock_ts, timezone.utc
+                ).strftime("%Y-%m-%d %H:%M UTC")
+
+                self.closed_trades.insert(0, {
+                    "symbol":      symbol,
+                    "pnl":         pnl,
+                    "target":      notional * TAKE_PROFIT_FRACTION,
+                    "qty":         qty,
+                    "avg_entry":   avg_ent,
+                    "close_price": price,
+                    "notional":    notional,
+                    "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "unblock_at":  unblock_str,
+                    "reason":      "MANUAL",
+                })
+                self.closed_trades = self.closed_trades[:500]
+
+        # Notificar cierre manual al Executor
+        self.executor.notify_close(
+            trade_id=trade_id,
+            symbol=symbol,
+            direction="SHORT",
+            reason="MANUAL",
+            close_price=price,
+            pnl=pnl,
+        )
+        self.log(
+            f"✋ CIERRE MANUAL {symbol}: PnL={pnl:.4f} | "
+            f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+        )
+        self.persist_state()
+        return True
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
@@ -1153,7 +1417,7 @@ class TradingBot:
         with self.lock:
             winners_raw        = [dict(w) for w in self.winners]
             positions_raw      = dict(self.positions)
-            closed             = list(self.closed_trades[:30])
+            closed             = list(self.closed_trades[:130])
             events             = list(self.events[:50])
             cooldown_snap      = dict(self.symbol_cooldown)
             price_blocked_snap = set(self.price_blocked)
@@ -1162,6 +1426,7 @@ class TradingBot:
             filter_cycle_count = self.filter_cycle_count
             last_filter_at     = self.last_filter_cycle_at
             all_symbols_count  = len(self.all_symbols)
+            total_realized_pnl = self.total_realized_pnl
 
         now = time.time()
 
@@ -1186,6 +1451,9 @@ class TradingBot:
             pnl   = pos.unrealized_pnl(price)
             total_unreal   += pnl
             total_notional += pos.notional
+            # Precio al que se activa el Stop Loss (pérdida = notional)
+            # Short SL: (avg_entry - sl_price) * qty = -notional → sl_price = avg_entry + notional/qty
+            sl_price = (pos.avg_entry + pos.notional / pos.qty) if pos.qty > 0 else 0.0
             open_positions.append({
                 "symbol":         symbol,
                 "mark_price":     price,
@@ -1194,6 +1462,8 @@ class TradingBot:
                 "notional":       pos.notional,
                 "target":         pos.notional * TAKE_PROFIT_FRACTION,
                 "unrealized_pnl": pnl,
+                "stop_loss_price": sl_price,
+                "trade_id":       pos.trade_id,
                 "fills":          [f.__dict__ for f in pos.fills],
                 "change":         next(
                     (w["change"] for w in winners_raw if w["symbol"] == symbol), 0.0
@@ -1261,8 +1531,10 @@ class TradingBot:
             "entry_levels":      ENTRY_LEVELS,
             "entry_notionals":   ENTRY_NOTIONALS,
             "take_profit_pct":   TAKE_PROFIT_FRACTION * 100,
-            "total_unrealized":  total_unreal,
+            "total_unrealized":   total_unreal,
+            "total_realized_pnl": total_realized_pnl,
             "total_notional":    total_notional,
+            "executor_url":      EXECUTOR_URL or "",
             "positions":         open_positions,
             "winners":           winners_out,
             "closed_trades":     closed,
@@ -1402,6 +1674,27 @@ HTML = r"""<!doctype html>
                   display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; }
     .filter-bar span { color: var(--muted); }
     .filter-bar b   { color: var(--purple); }
+    /* Botón de cierre manual */
+    .btn-close {
+      background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444;
+      border-radius: 6px; padding: 3px 10px; font-size: 11px; font-weight: 700;
+      cursor: pointer; transition: background .2s;
+    }
+    .btn-close:hover  { background: #991b1b; }
+    .btn-close:active { background: #b91c1c; }
+    .btn-close:disabled { opacity: .45; cursor: not-allowed; }
+    /* Badge de SL */
+    .sl-badge { display: inline-block; padding: 2px 7px; border-radius: 6px;
+                background: #1c1917; color: #fb923c;
+                border: 1px solid #78350f; font-size: 11px; white-space: nowrap; }
+    /* Badge de razón de cierre */
+    .reason-tp     { color: var(--green);  font-weight: 700; }
+    .reason-sl     { color: var(--red);    font-weight: 700; }
+    .reason-manual { color: var(--yellow); font-weight: 700; }
+    /* Executor status chip */
+    .executor-chip { background: #0f2027; border: 1px solid var(--teal);
+                     border-radius: 8px; padding: 4px 12px; font-size: 12px;
+                     color: var(--teal); display: inline-block; }
   </style>
 </head>
 <body>
@@ -1423,6 +1716,10 @@ HTML = r"""<!doctype html>
   <div class="cards">
     <div class="card"><div class="label">Modo</div><div id="mode" class="value warn sm">—</div></div>
     <div class="card"><div class="label">PnL no realizado</div><div id="pnl" class="value">—</div></div>
+    <div class="card" style="border-color:#22c55e55">
+      <div class="label">✅ PnL Realizado Total</div>
+      <div id="realizedPnl" class="value positive">—</div>
+    </div>
     <div class="card"><div class="label">Capital en posiciones</div><div id="notional" class="value">—</div></div>
     <div class="card"><div class="label">Último escaneo</div><div id="scan" class="value sm">—</div></div>
     <div class="card"><div class="label">Escaneos totales</div><div id="scanCount" class="value">—</div></div>
@@ -1450,6 +1747,10 @@ HTML = r"""<!doctype html>
     <div class="card">
       <div class="label">En cooldown (24h)</div>
       <div id="cooldownCount" class="value warn">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Executor</div>
+      <div id="executorStatus" class="value sm">—</div>
     </div>
   </div>
 
@@ -1498,15 +1799,20 @@ HTML = r"""<!doctype html>
 
   <!-- Posiciones abiertas -->
   <section>
-    <h2>Posiciones abiertas</h2>
+    <h2>Posiciones abiertas
+      <span style="color:var(--muted);font-size:12px;font-weight:400;margin-left:8px">
+        ⛔ SL = pérdida ≥ notional invertido
+      </span>
+    </h2>
     <table>
       <thead><tr>
         <th>Símbolo</th><th>Cambio 24h (WS)</th><th>Entrada media</th>
-        <th>Precio WS</th><th>Notional</th><th>Objetivo</th>
-        <th>PnL tiempo real</th><th>Tramos</th>
+        <th>Precio WS</th><th>Notional</th><th>Objetivo TP</th>
+        <th>Stop Loss (precio)</th><th>PnL tiempo real</th><th>Tramos</th>
+        <th>Cerrar</th>
       </tr></thead>
       <tbody id="tbPositions">
-        <tr><td colspan="8" style="color:var(--muted)">Sin posiciones</td></tr>
+        <tr><td colspan="10" style="color:var(--muted)">Sin posiciones</td></tr>
       </tbody>
     </table>
   </section>
@@ -1537,15 +1843,17 @@ HTML = r"""<!doctype html>
 
   <!-- Cierres -->
   <section>
-    <h2>Operaciones cerradas</h2>
+    <h2>Operaciones cerradas
+      <span id="totalRealizedBadge" style="margin-left:10px;font-size:13px;font-weight:400"></span>
+    </h2>
     <table>
       <thead><tr>
-        <th>Símbolo</th><th>PnL realizado</th><th>Objetivo</th>
+        <th>Símbolo</th><th>Motivo</th><th>PnL realizado</th><th>Objetivo TP</th>
         <th>Entrada media</th><th>Precio cierre</th>
         <th>Bloqueado hasta</th><th>Fecha cierre</th>
       </tr></thead>
       <tbody id="tbClosed">
-        <tr><td colspan="7" style="color:var(--muted)">Sin cierres aún</td></tr>
+        <tr><td colspan="8" style="color:var(--muted)">Sin cierres aún</td></tr>
       </tbody>
     </table>
   </section>
@@ -1640,6 +1948,20 @@ function render(d) {
   const pu = n(d.total_unrealized);
   q('pnl').textContent            = money(pu);
   q('pnl').className              = 'value ' + cls(pu);
+
+  const rp = n(d.total_realized_pnl);
+  q('realizedPnl').textContent    = money(rp);
+  q('realizedPnl').className      = 'value ' + cls(rp);
+
+  // Executor status
+  const exUrl = d.executor_url || '';
+  const exEl  = q('executorStatus');
+  if (exUrl) {
+    exEl.innerHTML = `<span class="executor-chip">🔗 ${exUrl.replace('https://','').split('/')[0]}</span>`;
+  } else {
+    exEl.innerHTML = `<span style="color:var(--muted);font-size:12px">No configurado</span>`;
+  }
+
   q('notional').textContent       = money(d.total_notional);
   q('scan').textContent           = d.last_scan_text         || 'pendiente';
   q('scanCount').textContent      = n(d.scan_count);
@@ -1718,7 +2040,13 @@ function render(d) {
   // ── Posiciones ────────────────────────────────────────────────────────────
   const positions = Array.isArray(d.positions) ? d.positions : [];
   q('tbPositions').innerHTML = tb(positions.map(p => {
-    const pnl   = n(p.unrealized_pnl);
+    const pnl    = n(p.unrealized_pnl);
+    const slPx   = n(p.stop_loss_price);
+    const mrkPx  = n(p.mark_price);
+    // Alerta si el precio está cerca del SL (dentro del 5%)
+    const slDist = slPx > 0 ? ((slPx - mrkPx) / mrkPx * 100) : 999;
+    const slCls  = slDist < 2 ? 'style="color:var(--red);font-weight:700"'
+                 : slDist < 5 ? 'style="color:var(--orange)"' : '';
     const fills = (Array.isArray(p.fills) ? p.fills : [])
       .map(f => `<span class="pill">+${fx(f.level,0)}% / ${fx(f.notional,2)}</span>`)
       .join(' ');
@@ -1729,11 +2057,13 @@ function render(d) {
       <td>${fx(p.avg_entry)}</td>
       <td>${fx(p.mark_price)}</td>
       <td>${money(p.notional)}</td>
-      <td>${money(p.target)}</td>
+      <td class="positive">${money(p.target)}</td>
+      <td ${slCls}><span class="sl-badge">⛔ ${fx(slPx)}</span></td>
       <td class="${cls(pnl)}">${money(pnl)}</td>
       <td>${fills}</td>
+      <td><button class="btn-close" onclick="closePosition('${p.symbol}', this)">Cerrar</button></td>
     </tr>`;
-  }), 'Sin posiciones abiertas', 8);
+  }), 'Sin posiciones abiertas', 10);
 
   // ── Ganadores (símbolos activos ≥15%) ────────────────────────────────────
   const winners     = Array.isArray(d.winners) ? d.winners : [];
@@ -1779,17 +2109,67 @@ function render(d) {
 
   // ── Cierres ───────────────────────────────────────────────────────────────
   const closed = Array.isArray(d.closed_trades) ? d.closed_trades : [];
-  q('tbClosed').innerHTML = tb(closed.map(t => `<tr>
-    <td style="font-weight:700">${t.symbol || ''}</td>
-    <td class="positive">${money(t.pnl)}</td>
-    <td>${money(t.target)}</td>
-    <td>${fx(t.avg_entry)}</td>
-    <td>${fx(t.close_price)}</td>
-    <td style="color:var(--orange)">${t.unblock_at || '—'}</td>
-    <td style="color:var(--muted)">${t.closed_at || ''}</td>
-  </tr>`), 'Sin cierres aún', 7);
+
+  // Badge de total realizado en el encabezado de la sección
+  const trBadge = q('totalRealizedBadge');
+  if (trBadge) {
+    const rpv = n(d.total_realized_pnl);
+    const rpCls = rpv >= 0 ? 'positive' : 'negative';
+    trBadge.innerHTML = closed.length
+      ? `— PnL total realizado: <span class="${rpCls}" style="font-weight:700">${money(rpv)}</span>`
+      : '';
+  }
+
+  const reasonLabel = r => {
+    if (!r) return '—';
+    if (r === 'TP')     return '<span class="reason-tp">✅ TP</span>';
+    if (r === 'SL')     return '<span class="reason-sl">⛔ SL</span>';
+    if (r === 'MANUAL') return '<span class="reason-manual">✋ Manual</span>';
+    return `<span style="color:var(--muted)">${r}</span>`;
+  };
+
+  q('tbClosed').innerHTML = tb(closed.map(t => {
+    const pnlVal = n(t.pnl);
+    return `<tr>
+      <td style="font-weight:700">${t.symbol || ''}</td>
+      <td>${reasonLabel(t.reason)}</td>
+      <td class="${cls(pnlVal)}">${money(pnlVal)}</td>
+      <td>${money(t.target)}</td>
+      <td>${fx(t.avg_entry)}</td>
+      <td>${fx(t.close_price)}</td>
+      <td style="color:var(--orange)">${t.unblock_at || '—'}</td>
+      <td style="color:var(--muted)">${t.closed_at || ''}</td>
+    </tr>`;
+  }), 'Sin cierres aún', 8);
 
   q('events').textContent = (Array.isArray(d.events) ? d.events : []).join('\n');
+}
+
+// ── Cierre manual de posición ────────────────────────────────────────────────
+async function closePosition(symbol, btn) {
+  if (!confirm(`¿Cerrar posición ${symbol} al precio actual de mercado?\n\nEsta acción es irreversible.`)) return;
+  btn.disabled    = true;
+  btn.textContent = '…';
+  try {
+    const resp = await fetch(`/api/close/${symbol}`, { method: 'POST', cache: 'no-store' });
+    const data = await resp.json();
+    if (data.ok) {
+      btn.textContent   = '✓';
+      btn.style.background = '#14532d';
+      btn.style.color      = '#86efac';
+      // Forzar poll inmediato para actualizar la tabla
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = setTimeout(poll, 300);
+    } else {
+      btn.disabled    = false;
+      btn.textContent = 'Cerrar';
+      alert(`Error al cerrar ${symbol}: ${data.error || 'desconocido'}`);
+    }
+  } catch (err) {
+    btn.disabled    = false;
+    btn.textContent = 'Cerrar';
+    alert(`Error de red al cerrar ${symbol}: ${err.message}`);
+  }
 }
 
 // ── Polling fetch() cada 2 s ─────────────────────────────────────────────────
@@ -1840,6 +2220,24 @@ def api_status():
     resp = jsonify(bot.snapshot())
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
+
+
+@app.post("/api/close/<symbol>")
+def api_close(symbol: str):
+    """Cierre manual de una posición abierta."""
+    symbol = symbol.upper().strip()
+    if not bot.loop or not bot.loop.is_running():
+        return jsonify({"ok": False, "error": "Bot loop no está activo"}), 503
+    future = asyncio.run_coroutine_threadsafe(
+        bot.close_position_manual(symbol), bot.loop
+    )
+    try:
+        ok = future.result(timeout=15)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    if ok:
+        return jsonify({"ok": True, "symbol": symbol, "msg": "Posición cerrada manualmente"})
+    return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o ya cerrada"}), 404
 
 
 @app.get("/health")
