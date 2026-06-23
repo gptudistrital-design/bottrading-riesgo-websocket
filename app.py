@@ -380,6 +380,7 @@ class TradingBot:
         self.closed_trades: List[dict] = []
         self.events:        List[str]  = []
         self.lock = threading.Lock()
+        self._trade_id_lock = threading.Lock()
 
         # Cooldown: symbol → timestamp hasta el que está bloqueado
         self.symbol_cooldown: Dict[str, float] = {}
@@ -496,8 +497,8 @@ class TradingBot:
     # ── Main ──────────────────────────────────────────────────────────────────
 
     def _next_trade_id(self) -> int:
-        """Genera un trade_id único e incremental (thread-safe)."""
-        with self.lock:
+        """Genera un trade_id único e incremental sin reentrar en self.lock."""
+        with self._trade_id_lock:
             self._trade_id_seq += 1
             return self._trade_id_seq
 
