@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -2284,7 +2285,7 @@ async function closePosition(symbol, btn) {
     } else {
       btn.disabled    = false;
       btn.textContent = 'Cerrar';
-      alert(`Error al cerrar ${symbol}: ${data.error || 'desconocido'}`);
+      alert(`Error al cerrar ${symbol}: ${data.error || `HTTP ${resp.status}`}`);
     }
   } catch (err) {
     btn.disabled    = false;
@@ -2354,10 +2355,49 @@ def api_close(symbol: str):
     )
     try:
         ok = future.result(timeout=15)
+    except concurrent.futures.TimeoutError:
+        # La tarea sigue corriendo en el loop del bot; no la cancelamos para
+        # no dejar el cierre a medias, pero avisamos con un mensaje claro.
+        return jsonify({
+            "ok": False,
+            "error": "Tiempo de espera agotado cerrando posición (el cierre puede completarse en segundo plano, revisa en unos segundos)",
+        }), 504
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        msg = str(exc).strip() or f"{type(exc).__name__} (timeout esperando respuesta del exchange)"
+        return jsonify({"ok": False, "error": msg}), 500
     if ok:
         return jsonify({"ok": True, "symbol": symbol, "msg": "Posición cerrada manualmente"})
+    return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o ya cerrada"}), 404
+
+
+@app.post("/api/force-close/<symbol>")
+def api_force_close(symbol: str):
+    """Cierre de EMERGENCIA: ignora el guard anti-doble-cierre y libera el
+    símbolo aunque haya quedado 'pegado' en _closing_symbols por un timeout
+    o deadlock previo. Úsalo solo si /api/close se queda atascado."""
+    symbol = symbol.upper().strip()
+    if not bot.loop or not bot.loop.is_running():
+        return jsonify({"ok": False, "error": "Bot loop no está activo"}), 503
+
+    # 1) liberar el guard sin esperar a que la tarea vieja termine
+    with bot.lock:
+        bot._closing_symbols.discard(symbol)
+
+    future = asyncio.run_coroutine_threadsafe(
+        bot.close_position_manual(symbol), bot.loop
+    )
+    try:
+        ok = future.result(timeout=20)
+    except concurrent.futures.TimeoutError:
+        return jsonify({
+            "ok": False,
+            "error": "Tiempo de espera agotado en cierre forzado (revisa /api/status en unos segundos)",
+        }), 504
+    except Exception as exc:
+        msg = str(exc).strip() or f"{type(exc).__name__} (timeout esperando respuesta del exchange)"
+        return jsonify({"ok": False, "error": msg}), 500
+    if ok:
+        return jsonify({"ok": True, "symbol": symbol, "msg": "Posición cerrada (forzado)"})
     return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o ya cerrada"}), 404
 
 
