@@ -184,7 +184,6 @@ LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
 # ── Gestión de símbolos ───────────────────────────────────────────────────────
 INITIAL_SYMBOLS = [ s.strip() for s in os.getenv("INITIAL_SYMBOLS", "").split(",") if s.strip() ]
-# ── Gestión de símbolos ───────────────────────────────────────────────────────
 # Lista completa de símbolos: REST inicial + caché en disco + refresh cada 12 h
 SYMBOLS_CACHE_FILE   = os.getenv(
     "SYMBOLS_CACHE_FILE",
