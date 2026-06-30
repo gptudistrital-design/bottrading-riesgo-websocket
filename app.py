@@ -252,7 +252,6 @@ class BotPosition:
     trade_id:     int   = 0
     # Stop loss configurable en USD (pérdida absoluta, valor negativo).
     # Por defecto toma DEFAULT_STOP_LOSS_USD, pero puede sobreescribirse
-    # individualmente por posición desde el dashboard.
     sl_usd:       float = DEFAULT_STOP_LOSS_USD
 
     @property
