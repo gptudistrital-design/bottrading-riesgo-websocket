@@ -221,6 +221,11 @@ ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
 TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
 
+# Stop loss por defecto en USD (pérdida absoluta, valor negativo).
+# Se aplica a cada posición nueva, pero puede sobreescribirse individualmente
+# desde el dashboard web (POST /api/set-sl/<symbol>).
+DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-5.0"))
+
 # ── Executor externo ──────────────────────────────────────────────────────────
 EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
@@ -246,6 +251,10 @@ class BotPosition:
     realized_pnl: float = 0.0
     status:       str   = "OPEN"
     trade_id:     int   = 0
+    # Stop loss configurable en USD (pérdida absoluta, valor negativo).
+    # Por defecto toma DEFAULT_STOP_LOSS_USD, pero puede sobreescribirse
+    # individualmente por posición desde el dashboard.
+    sl_usd:       float = DEFAULT_STOP_LOSS_USD
 
     @property
     def qty(self) -> float:
@@ -282,13 +291,15 @@ class BinanceFuturesClient:
         await self.load_exchange_info()
 
     async def request(self, method: str, path: str,
-                      params: Optional[dict] = None, signed: bool = False) -> Any:
+                      params: Optional[dict] = None, signed: bool = False,
+                      timeout: int = 15) -> Any:
         return await asyncio.to_thread(
-            self._sync_request, BASE_URL, method, path, params, signed
+            self._sync_request, BASE_URL, method, path, params, signed, timeout
         )
 
     def _sync_request(self, base_url: str, method: str, path: str,
-                      params: Optional[dict] = None, signed: bool = False) -> Any:
+                      params: Optional[dict] = None, signed: bool = False,
+                      timeout: int = 15) -> Any:
         params  = dict(params or {})
         headers = {"User-Agent": "BOTSHORT/2.0"}
         if signed:
@@ -307,7 +318,7 @@ class BinanceFuturesClient:
         url   = f"{base_url}{path}" + (f"?{query}" if query else "")
         req   = urllib.request.Request(url, headers=headers, method=method.upper())
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -363,10 +374,11 @@ class BinanceFuturesClient:
         qty = self.normalize_qty(symbol, qty)
         if qty <= 0 or PAPER_MODE or not LIVE_TRADING:
             return
+        # Timeout 10 s: debe completarse antes del timeout de Flask (30 s)
         await self.request("POST", "/fapi/v1/order",
             {"symbol": symbol, "side": "BUY", "type": "MARKET",
              "quantity": qty, "reduceOnly": "true"},
-            signed=True)
+            signed=True, timeout=10)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1131,7 +1143,10 @@ class TradingBot:
         while self.running:
             try:
                 if self.price_cache and self.positions:
-                    all_prices = self.price_cache.get_all_prices()
+                    try:
+                        all_prices = self.price_cache.get_all_prices()
+                    except Exception:
+                        all_prices = {}
                     with self.lock:
                         pos_syms = list(self.positions.keys())
                     for symbol in pos_syms:
@@ -1139,6 +1154,8 @@ class TradingBot:
                         if price and price > 0:
                             await self._maybe_stop_loss(symbol, price)
                             await self._maybe_take_profit(symbol, price)
+                        # Ceder el event loop en cada símbolo para no bloquearlo
+                        await asyncio.sleep(0)
             except asyncio.CancelledError:
                 if not self.running:
                     break
@@ -1237,23 +1254,36 @@ class TradingBot:
             self.log(f"Error abriendo short {symbol} nivel {level}: {exc}")
 
     async def _maybe_take_profit(self, symbol: str, price: float) -> None:
+        # ── Pre-verificación sin guard (caso más común: TP no alcanzado) ──────
+        # Esto evita bloquear close_position_manual con el guard innecesariamente
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.fills:
+                return
+            pnl    = pos.unrealized_pnl(price)
+            target = pos.notional * TAKE_PROFIT_FRACTION
+
+        if pnl < target:
+            return  # Caso normal: sin TP todavía, sin tocar el guard
+
+        # ── TP alcanzado: adquirir guard y cerrar ─────────────────────────────
         if not self._begin_close_guard(symbol):
             return
 
         try:
+            # Re-verificar tras adquirir el guard (condición puede haber cambiado)
             with self.lock:
                 pos = self.positions.get(symbol)
                 if not pos or pos.status != "OPEN" or not pos.fills:
                     return
                 pnl      = pos.unrealized_pnl(price)
                 target   = pos.notional * TAKE_PROFIT_FRACTION
+                if pnl < target:
+                    return
                 qty      = pos.qty
                 avg_ent  = pos.avg_entry
                 notional = pos.notional
                 trade_id = pos.trade_id
-
-            if pnl < target:
-                return
 
             try:
                 await self.client.close_short(symbol, qty)
@@ -1307,18 +1337,34 @@ class TradingBot:
             self._end_close_guard(symbol)
 
     async def _maybe_stop_loss(self, symbol: str, price: float) -> None:
-        """Cierra la posición si la pérdida no realizada >= notional total (SL máximo)."""
+        """Cierra la posición si la pérdida no realizada >= stop loss configurado
+        para esa posición (pos.sl_usd, por defecto DEFAULT_STOP_LOSS_USD)."""
+        # ── Pre-verificación sin guard ────────────────────────────────────────
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.fills:
+                return
+            pnl      = pos.unrealized_pnl(price)
+            notional = pos.notional
+            sl_usd   = pos.sl_usd
+
+        if pnl > sl_usd:
+            return  # Caso normal: sin SL todavía, sin tocar el guard
+
+        # ── SL alcanzado: adquirir guard y cerrar ─────────────────────────────
         if not self._begin_close_guard(symbol):
             return
 
         try:
+            # Re-verificar tras adquirir el guard
             with self.lock:
                 pos = self.positions.get(symbol)
                 if not pos or pos.status != "OPEN" or not pos.fills:
                     return
                 pnl      = pos.unrealized_pnl(price)
                 notional = pos.notional
-                if pnl > -notional:
+                sl_usd   = pos.sl_usd
+                if pnl > sl_usd:
                     return
                 qty      = pos.qty
                 avg_ent  = pos.avg_entry
@@ -1368,12 +1414,26 @@ class TradingBot:
                 pnl=pnl,
             )
             self.log(
-                f"⛔ STOP LOSS {symbol}: PnL={pnl:.4f} | notional={notional:.4f} | "
+                f"⛔ STOP LOSS {symbol}: PnL={pnl:.4f} | SL configurado={sl_usd:.4f} | "
                 f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
             )
             self.persist_state()
         finally:
             self._end_close_guard(symbol)
+
+    def set_stop_loss(self, symbol: str, sl_usd: float) -> bool:
+        """Establece el stop loss (en USD, valor negativo) para una posición
+        abierta específica. Se puede llamar desde el dashboard en cualquier
+        momento mientras la posición esté abierta."""
+        symbol = symbol.upper().strip()
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN":
+                return False
+            pos.sl_usd = sl_usd
+        self.log(f"Stop loss actualizado para {symbol}: {sl_usd:.4f} USD")
+        self.persist_state()
+        return True
 
     async def close_position_manual(self, symbol: str) -> bool:
         """Cierre manual de una posición abierta desde la UI."""
@@ -1506,9 +1566,9 @@ class TradingBot:
             pnl   = pos.unrealized_pnl(price)
             total_unreal   += pnl
             total_notional += pos.notional
-            # Precio al que se activa el Stop Loss (pérdida = notional)
-            # Short SL: (avg_entry - sl_price) * qty = -notional → sl_price = avg_entry + notional/qty
-            sl_price = (pos.avg_entry + pos.notional / pos.qty) if pos.qty > 0 else 0.0
+            # Precio al que se activa el Stop Loss configurado para esta posición
+            # Short SL: (avg_entry - sl_price) * qty = sl_usd → sl_price = avg_entry - sl_usd/qty
+            sl_price = (pos.avg_entry - pos.sl_usd / pos.qty) if pos.qty > 0 else 0.0
             open_positions.append({
                 "symbol":         symbol,
                 "mark_price":     price,
@@ -1518,6 +1578,7 @@ class TradingBot:
                 "target":         pos.notional * TAKE_PROFIT_FRACTION,
                 "unrealized_pnl": pnl,
                 "stop_loss_price": sl_price,
+                "stop_loss_usd":   pos.sl_usd,
                 "trade_id":       pos.trade_id,
                 "fills":          [f.__dict__ for f in pos.fills],
                 "change":         next(
@@ -1586,6 +1647,7 @@ class TradingBot:
             "entry_levels":      ENTRY_LEVELS,
             "entry_notionals":   ENTRY_NOTIONALS,
             "take_profit_pct":   TAKE_PROFIT_FRACTION * 100,
+            "default_stop_loss_usd": DEFAULT_STOP_LOSS_USD,
             "total_unrealized":   total_unreal,
             "total_realized_pnl": total_realized_pnl,
             "total_notional":    total_notional,
@@ -1923,18 +1985,18 @@ HTML = r"""<!doctype html>
   <section>
     <h2>Posiciones abiertas
       <span style="color:var(--muted);font-size:12px;font-weight:400;margin-left:8px">
-        ⛔ SL = pérdida ≥ notional invertido
+        ⛔ SL configurable por posición (por defecto $-5.00)
       </span>
     </h2>
     <table>
       <thead><tr>
         <th>Símbolo</th><th>Cambio 24h (WS)</th><th>Entrada media</th>
         <th>Precio WS</th><th>Notional</th><th>Objetivo TP</th>
-        <th>Stop Loss (precio)</th><th>PnL tiempo real</th><th>Tramos</th>
+        <th>Stop Loss (precio)</th><th>Stop Loss (USD)</th><th>PnL tiempo real</th><th>Tramos</th>
         <th>Cerrar</th>
       </tr></thead>
       <tbody id="tbPositions">
-        <tr><td colspan="10" style="color:var(--muted)">Sin posiciones</td></tr>
+        <tr><td colspan="11" style="color:var(--muted)">Sin posiciones</td></tr>
       </tbody>
     </table>
   </section>
@@ -1987,6 +2049,30 @@ HTML = r"""<!doctype html>
   </section>
 
 </main>
+
+<!-- Modal: editar Stop Loss -->
+<div id="slModalOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6);
+     z-index:1000; align-items:center; justify-content:center;">
+  <div style="background:var(--card); border:1px solid var(--border); border-radius:12px;
+       padding:20px; width:320px; max-width:90vw;">
+    <h3 style="margin:0 0 4px 0; font-size:16px;">Editar Stop Loss</h3>
+    <p style="margin:0 0 14px 0; color:var(--muted); font-size:13px;">
+      Símbolo: <strong id="slModalSymbol" style="color:var(--txt)">—</strong>
+    </p>
+    <label style="display:block; font-size:12px; color:var(--muted); margin-bottom:6px;">
+      Pérdida máxima en USD (valor negativo, ej. -5)
+    </label>
+    <input id="slModalInput" type="number" step="0.1"
+           style="width:100%; box-sizing:border-box; background:#0f172a; color:var(--txt);
+           border:1px solid var(--border); border-radius:6px; padding:8px; font-size:14px;
+           margin-bottom:6px;">
+    <p id="slModalError" style="display:none; color:var(--red); font-size:12px; margin:0 0 10px 0;"></p>
+    <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:10px;">
+      <button id="slModalCancel" class="btn-close" style="background:#334155;">Cancelar</button>
+      <button id="slModalSave" class="btn-close" style="background:#166534;">Guardar</button>
+    </div>
+  </div>
+</div>
 
 <script>
 // ── Utilidades ──────────────────────────────────────────────────────────────
@@ -2172,6 +2258,7 @@ function render(d) {
     const fills = (Array.isArray(p.fills) ? p.fills : [])
       .map(f => `<span class="pill">+${fx(f.level,0)}% / ${fx(f.notional,2)}</span>`)
       .join(' ');
+    const slUsd = n(p.stop_loss_usd);
     return `<tr>
       <td><a class="sym-link" href="https://www.binance.com/en/futures/${p.symbol}"
              target="_blank">${p.symbol}</a></td>
@@ -2181,6 +2268,10 @@ function render(d) {
       <td>${money(p.notional)}</td>
       <td class="positive">${money(p.target)}</td>
       <td ${slCls}><span class="sl-badge">⛔ ${fx(slPx)}</span></td>
+      <td>
+        <button class="btn-close" style="padding:2px 8px"
+                onclick="editStopLoss('${p.symbol}', ${slUsd}, this)">${money(slUsd)}</button>
+      </td>
       <td class="${cls(pnl)}">${money(pnl)}</td>
       <td>${fills}</td>
       <td><button class="btn-close" onclick="closePosition('${p.symbol}', this)">Cerrar</button></td>
@@ -2266,6 +2357,80 @@ function render(d) {
 
   q('events').textContent = (Array.isArray(d.events) ? d.events : []).join('\n');
 }
+
+// ── Modal: editar Stop Loss individual por posición ─────────────────────────
+let _slModalSymbol = null;
+let _slModalBtn    = null;
+
+function editStopLoss(symbol, currentSl, btn) {
+  _slModalSymbol = symbol;
+  _slModalBtn    = btn;
+  q('slModalSymbol').textContent = symbol;
+  q('slModalInput').value        = currentSl;
+  q('slModalError').style.display = 'none';
+  q('slModalError').textContent   = '';
+  q('slModalOverlay').style.display = 'flex';
+  setTimeout(() => q('slModalInput').focus(), 50);
+}
+
+function closeSlModal() {
+  q('slModalOverlay').style.display = 'none';
+  _slModalSymbol = null;
+  _slModalBtn    = null;
+}
+
+async function saveSlModal() {
+  const symbol = _slModalSymbol;
+  const btn    = _slModalBtn;
+  if (!symbol) return;
+
+  const raw   = q('slModalInput').value;
+  const slUsd = parseFloat(String(raw).replace(',', '.'));
+  if (isNaN(slUsd) || slUsd >= 0) {
+    q('slModalError').textContent   = 'El Stop Loss debe ser un número negativo (por ejemplo -5).';
+    q('slModalError').style.display = 'block';
+    return;
+  }
+
+  const saveBtn = q('slModalSave');
+  saveBtn.disabled    = true;
+  saveBtn.textContent = '…';
+  try {
+    const resp = await fetch(`/api/set-sl/${symbol}`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ sl_usd: slUsd }),
+      cache:   'no-store',
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      closeSlModal();
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = setTimeout(poll, 300);
+    } else {
+      q('slModalError').textContent   = data.error || `Error HTTP ${resp.status}`;
+      q('slModalError').style.display = 'block';
+    }
+  } catch (err) {
+    q('slModalError').textContent   = `Error de red: ${err.message}`;
+    q('slModalError').style.display = 'block';
+  } finally {
+    saveBtn.disabled    = false;
+    saveBtn.textContent = 'Guardar';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  q('slModalCancel').addEventListener('click', closeSlModal);
+  q('slModalSave').addEventListener('click', saveSlModal);
+  q('slModalOverlay').addEventListener('click', (e) => {
+    if (e.target.id === 'slModalOverlay') closeSlModal();
+  });
+  q('slModalInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveSlModal();
+    if (e.key === 'Escape') closeSlModal();
+  });
+});
 
 // ── Cierre manual de posición ────────────────────────────────────────────────
 async function closePosition(symbol, btn) {
@@ -2368,6 +2533,23 @@ def api_close(symbol: str):
     if ok:
         return jsonify({"ok": True, "symbol": symbol, "msg": "Posición cerrada manualmente"})
     return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o ya cerrada"}), 404
+
+
+@app.post("/api/set-sl/<symbol>")
+def api_set_sl(symbol: str):
+    """Establece el stop loss (en USD, valor negativo) de una posición abierta."""
+    symbol = symbol.upper().strip()
+    data = request.get_json(silent=True) or {}
+    try:
+        sl_usd = float(data.get("sl_usd"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "sl_usd inválido"}), 400
+    if sl_usd >= 0:
+        return jsonify({"ok": False, "error": "sl_usd debe ser un valor negativo (pérdida)"}), 400
+    ok = bot.set_stop_loss(symbol, sl_usd)
+    if ok:
+        return jsonify({"ok": True, "symbol": symbol, "sl_usd": sl_usd})
+    return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o cerrada"}), 404
 
 
 @app.post("/api/force-close/<symbol>")
