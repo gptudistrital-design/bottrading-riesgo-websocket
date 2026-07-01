@@ -198,7 +198,7 @@ MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "20"))  # >
 FULL_SUBSCRIBE_WAIT_SECS = int(os.getenv("FULL_SUBSCRIBE_WAIT_SECS", "30"))   # (legacy) espera ticker sub ALL
 
 # En vez de suscribir todos al mismo tiempo, se crean WS temporales por lote
-FILTER_BATCH_SIZE      = int(os.getenv("FILTER_BATCH_SIZE",      "527"))   # símbolos por lote
+FILTER_BATCH_SIZE      = int(os.getenv("FILTER_BATCH_SIZE",      "570"))   # símbolos por lote
 FILTER_BATCH_WAIT_SECS = int(os.getenv("FILTER_BATCH_WAIT_SECS", "10"))   # segundos de espera por lote
 FILTER_BATCH_PAUSE     = float(os.getenv("FILTER_BATCH_PAUSE",   "1.5"))  # pausa entre lotes (segundos)
 
@@ -218,7 +218,7 @@ MAX_PRICE_BLOCK = float(os.getenv("MAX_PRICE_BLOCK", "1.5"))
 
 ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150,200,250").split(",")]
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
-TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
+TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.125"))
 
 # Stop loss por defecto en USD (pérdida absoluta, valor negativo).
 # Se aplica a cada posición nueva, pero puede sobreescribirse individualmente
