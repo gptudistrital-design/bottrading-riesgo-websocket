@@ -218,7 +218,7 @@ MAX_PRICE_BLOCK = float(os.getenv("MAX_PRICE_BLOCK", "1.5"))
 
 ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150,200,250").split(",")]
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
-TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
+TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.1428"))
 
 # Stop loss por defecto en USD (pérdida absoluta, valor negativo).
 # Se aplica a cada posición nueva, pero puede sobreescribirse individualmente
