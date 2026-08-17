@@ -182,6 +182,11 @@ API_KEY       = os.getenv("BINANCE_API_KEY",    "")
 API_SECRET    = os.getenv("BINANCE_API_SECRET", "")
 LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
 STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
+
+# Archivo donde se acumula, de forma persistente e independiente del STATE_FILE
+# (que se puede sobreescribir/limpiar), el histórico MAE/MFE de cada operación
+# cerrada. Este histórico alimenta el motor de stop loss adaptativo.
+SL_STATS_FILE = os.getenv("SL_STATS_FILE", os.path.join(tempfile.gettempdir(), "botshort_sl_stats.json"))
 # ── Gestión de símbolos ───────────────────────────────────────────────────────
 INITIAL_SYMBOLS = [ s.strip() for s in os.getenv("INITIAL_SYMBOLS", "").split(",") if s.strip() ]
 # Lista completa de símbolos: REST inicial + caché en disco + refresh cada 12 h
@@ -253,6 +258,16 @@ class BotPosition:
     # Stop loss configurable en USD (pérdida absoluta, valor negativo).
     # Por defecto toma DEFAULT_STOP_LOSS_USD, pero puede sobreescribirse
     sl_usd:       float = DEFAULT_STOP_LOSS_USD
+    # True si el usuario fijó el SL manualmente desde el dashboard: en ese
+    # caso el motor adaptativo deja de recalcular sl_usd para esta posición.
+    sl_is_manual: bool  = False
+
+    # ── MAE / MFE (Maximum Adverse / Favorable Excursion) ──────────────────
+    # Se actualizan en cada chequeo de precio mientras la posición está
+    # abierta. mae_usd es el peor PnL no realizado visto (más negativo, o 0
+    # si nunca estuvo en contra); mfe_usd es el mejor PnL no realizado visto.
+    mae_usd:      float = 0.0
+    mfe_usd:      float = 0.0
 
     @property
     def qty(self) -> float:
@@ -380,6 +395,181 @@ class BinanceFuturesClient:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MOTOR DE STOP LOSS ADAPTATIVO (basado en MAE / MFE histórico)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AdaptiveStopLossEngine:
+    """
+    Aprende el stop loss "óptimo" observando, para cada operación cerrada,
+    cuánto se movió en contra (MAE) y a favor (MFE) antes de resolverse.
+
+    Idea central (aportada por el usuario):
+      - Una operación que terminó en TP nos dice hasta dónde puede llegar el
+        precio en contra SIN destruir una operación ganadora. Su MAE es una
+        cota "segura" de SL.
+      - Una operación que terminó en SL no nos dice cuál es el SL óptimo
+        (darle más espacio simplemente habría ampliado la pérdida), así que
+        su MAE NO se usa para calcular el nuevo stop loss (solo se guarda
+        como referencia histórica).
+
+    Reglas de progresión (sobre el total de operaciones cerradas, cualquiera
+    que sea su motivo de cierre):
+      - < 30 operaciones  -> SL fijo = default_sl_usd (p.ej. -7 USD)
+      - 30-99 operaciones -> SL = el peor MAE-por-posición entre las que
+                             cerraron en TP
+      - >= 100 operaciones -> SL = promedio de los 10 peores MAE-por-posición
+                             entre las que cerraron en TP; se recalcula cada
+                             vez que se cierra una nueva operación
+
+    Normalización por nº de niveles/tramos abiertos en la MISMA posición:
+      Cuando abres un símbolo en varios niveles (p.ej. SOLUSDT en +50%, +75%
+      y +100%), esa posición terminó con 3 tramos. Su MAE se reparte entre
+      esos tramos (mae_usd / n_niveles) antes de guardarlo, para que el
+      histórico represente siempre "MAE por un solo tramo/nivel". Al aplicar
+      el SL a una posición abierta, se hace el proceso inverso: el SL base
+      por nivel se multiplica por el nº de tramos que esa posición tiene
+      abiertos en ese momento, dando el SL efectivo total para esa posición.
+    """
+
+    def __init__(self, default_sl_usd: float, stats_file: str, logger=None) -> None:
+        self.default_sl_usd = default_sl_usd
+        self.stats_file      = stats_file
+        self.logger          = logger or print
+        self.records: List[dict] = []
+        self._lock = threading.Lock()
+        self._load()
+
+    def _log(self, message: str) -> None:
+        try:
+            self.logger(message)
+        except Exception:
+            pass
+
+    # ── Persistencia (independiente del STATE_FILE general) ────────────────
+
+    def _load(self) -> None:
+        try:
+            if os.path.exists(self.stats_file):
+                with open(self.stats_file, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                records = data.get("records", []) if isinstance(data, dict) else []
+                self.records = records if isinstance(records, list) else []
+                self._log(
+                    f"[adaptive-sl] histórico cargado: {len(self.records)} operaciones "
+                    f"({sum(1 for r in self.records if r.get('reason') == 'TP')} TP)"
+                )
+        except Exception as exc:
+            self._log(f"[adaptive-sl] no pude cargar histórico: {exc}")
+            self.records = []
+
+    def _save(self) -> None:
+        tmp = f"{self.stats_file}.tmp"
+        try:
+            # Cap defensivo: no crecer indefinidamente en disco.
+            trimmed = self.records[-5000:]
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"records": trimmed}, fh, ensure_ascii=False, default=str)
+            os.replace(tmp, self.stats_file)
+        except Exception as exc:
+            self._log(f"[adaptive-sl] no pude persistir histórico: {exc}")
+
+    # ── Registro de operaciones cerradas ────────────────────────────────────
+
+    def add_trade(
+        self,
+        symbol: str,
+        reason: str,
+        mae_usd: float,
+        mfe_usd: float,
+        n_levels: int,
+        notional: float,
+        pnl: float,
+    ) -> dict:
+        """Registra una operación cerrada. Debe llamarse UNA vez por cierre,
+        con mae_usd/mfe_usd ya medidos durante la vida de la posición.
+
+        n_levels: cantidad de niveles/tramos de entrada que tenía ABIERTOS
+        esa posición al cerrarse (p.ej. SOLUSDT con +50%/+75%/+100% => 3).
+        """
+        n = max(1, int(n_levels))
+        record = {
+            "symbol":           symbol,
+            "reason":           reason,
+            "mae_usd":          round(mae_usd, 6),
+            "mfe_usd":          round(mfe_usd, 6),
+            "n_levels":         n,
+            "mae_per_position": round(mae_usd / n, 6),
+            "notional":         notional,
+            "pnl":              pnl,
+            "closed_at":        datetime.now(timezone.utc).isoformat(),
+        }
+        with self._lock:
+            self.records.append(record)
+            self._save()
+        return record
+
+    # ── Cálculo del SL adaptativo ───────────────────────────────────────────
+
+    @property
+    def total_closed(self) -> int:
+        return len(self.records)
+
+    def _tp_mae_per_position(self) -> List[float]:
+        return [
+            r["mae_per_position"] for r in self.records
+            if r.get("reason") == "TP" and isinstance(r.get("mae_per_position"), (int, float))
+        ]
+
+    def base_sl_per_position(self) -> float:
+        """SL recomendado (USD, negativo) para UN SOLO nivel/tramo de
+        entrada (p.ej. solo el tramo +50% de una posición)."""
+        total = self.total_closed
+        if total < 30:
+            return self.default_sl_usd
+
+        tp_maes = self._tp_mae_per_position()
+        if not tp_maes:
+            # Aún no hay operaciones ganadoras (TP) de las que aprender.
+            return self.default_sl_usd
+
+        if total < 100:
+            # El peor (más negativo) MAE-por-nivel visto entre los TP.
+            return min(tp_maes)
+
+        # >= 100 operaciones: promedio de los 10 peores MAE-por-nivel.
+        worst10 = sorted(tp_maes)[:10]
+        return sum(worst10) / len(worst10)
+
+    def effective_sl(self, n_levels_open: int) -> float:
+        """SL efectivo (USD, negativo) para una posición que tiene
+        n_levels_open niveles/tramos de entrada abiertos ahora mismo
+        (p.ej. 3 si el símbolo abrió en +50%, +75% y +100%)."""
+        base = self.base_sl_per_position()
+        n    = max(1, int(n_levels_open))
+        return base * n
+
+    def stats_summary(self) -> dict:
+        total   = self.total_closed
+        tp_maes = self._tp_mae_per_position()
+        if total < 30:
+            phase = "fijo"
+        elif total < 100:
+            phase = "peor_mae_tp"
+        else:
+            phase = "promedio_10_peores_mae_tp"
+        return {
+            "total_closed":         total,
+            "tp_count":             sum(1 for r in self.records if r.get("reason") == "TP"),
+            "sl_count":             sum(1 for r in self.records if r.get("reason") == "SL"),
+            "manual_count":         sum(1 for r in self.records if r.get("reason") == "MANUAL"),
+            "phase":                phase,
+            "base_sl_per_position": round(self.base_sl_per_position(), 4),
+            "trades_to_next_phase": max(0, (30 if total < 30 else 100) - total) if total < 100 else 0,
+            "tp_mae_samples":       len(tp_maes),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BOT PRINCIPAL
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -392,6 +582,15 @@ class TradingBot:
         self.events:        List[str]  = []
         self.lock = threading.Lock()
         self._trade_id_lock = threading.Lock()
+
+        # Motor de stop loss adaptativo (histórico MAE/MFE persistente).
+        # Se instancia tras self.events/self.lock porque su carga inicial
+        # puede emitir logs vía self.log().
+        self.adaptive_sl = AdaptiveStopLossEngine(
+            default_sl_usd=DEFAULT_STOP_LOSS_USD,
+            stats_file=SL_STATS_FILE,
+            logger=self.log,
+        )
 
         # Cooldown: symbol → timestamp hasta el que está bloqueado
         self.symbol_cooldown: Dict[str, float] = {}
@@ -1087,6 +1286,7 @@ class TradingBot:
                         if change >= level and kline_ok:
                             await self._ensure_short(symbol, level, notional, price, change)
 
+                    self._track_excursion(symbol, price)
                     await self._maybe_stop_loss(symbol, price)
                     await self._maybe_take_profit(symbol, price)
 
@@ -1098,6 +1298,7 @@ class TradingBot:
                     if symbol not in winner_syms:
                         price = all_prices.get(symbol)
                         if price:
+                            self._track_excursion(symbol, price)
                             await self._maybe_stop_loss(symbol, price)
                             await self._maybe_take_profit(symbol, price)
 
@@ -1150,6 +1351,7 @@ class TradingBot:
                     for symbol in pos_syms:
                         price = all_prices.get(symbol)
                         if price and price > 0:
+                            self._track_excursion(symbol, price)
                             await self._maybe_stop_loss(symbol, price)
                             await self._maybe_take_profit(symbol, price)
                         # Ceder el event loop en cada símbolo para no bloquearlo
@@ -1251,6 +1453,22 @@ class TradingBot:
             self.last_error = str(exc)
             self.log(f"Error abriendo short {symbol} nivel {level}: {exc}")
 
+    def _track_excursion(self, symbol: str, price: float) -> None:
+        """Actualiza MAE (peor PnL no realizado) y MFE (mejor PnL no
+        realizado) de la posición abierta en `symbol` con el precio actual.
+        Debe llamarse en cada chequeo de precio, antes de evaluar TP/SL."""
+        if price <= 0:
+            return
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.fills:
+                return
+            pnl = pos.unrealized_pnl(price)
+            if pnl < pos.mae_usd:
+                pos.mae_usd = pnl
+            if pnl > pos.mfe_usd:
+                pos.mfe_usd = pnl
+
     async def _maybe_take_profit(self, symbol: str, price: float) -> None:
         # ── Pre-verificación sin guard (caso más común: TP no alcanzado) ──────
         # Esto evita bloquear close_position_manual con el guard innecesariamente
@@ -1282,6 +1500,9 @@ class TradingBot:
                 avg_ent  = pos.avg_entry
                 notional = pos.notional
                 trade_id = pos.trade_id
+                mae_usd  = pos.mae_usd
+                mfe_usd  = pos.mfe_usd
+                n_levels = len(pos.fills)  # nº de niveles/tramos abiertos en ESTA posición
 
             try:
                 await self.client.close_short(symbol, qty)
@@ -1315,8 +1536,17 @@ class TradingBot:
                         "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                         "unblock_at":  unblock_str,
                         "reason":      "TP",
+                        "mae_usd":     mae_usd,
+                        "mfe_usd":     mfe_usd,
                     })
                     self.closed_trades = self.closed_trades[:500]
+
+            # Solo las operaciones que llegan a TP alimentan el cálculo del
+            # stop loss adaptativo (ver AdaptiveStopLossEngine).
+            self.adaptive_sl.add_trade(
+                symbol=symbol, reason="TP", mae_usd=mae_usd, mfe_usd=mfe_usd,
+                n_levels=n_levels, notional=notional, pnl=pnl,
+            )
 
             self.executor.notify_close(
                 trade_id=trade_id,
@@ -1335,8 +1565,16 @@ class TradingBot:
             self._end_close_guard(symbol)
 
     async def _maybe_stop_loss(self, symbol: str, price: float) -> None:
-        """Cierra la posición si la pérdida no realizada >= stop loss configurado
-        para esa posición (pos.sl_usd, por defecto DEFAULT_STOP_LOSS_USD)."""
+        """Cierra la posición si la pérdida no realizada >= stop loss
+        efectivo para esa posición.
+
+        El stop loss efectivo es, por defecto, calculado dinámicamente por
+        el motor adaptativo (self.adaptive_sl) a partir del histórico
+        MAE/MFE, multiplicado por el nº de niveles/tramos que esta posición
+        tiene abiertos en ese momento (p.ej. si SOLUSDT abrió en +50%,
+        +75% y +100%, el multiplicador es 3). Si el usuario fijó el SL
+        manualmente para este símbolo (pos.sl_is_manual), se respeta ese
+        valor fijo en su lugar."""
         # ── Pre-verificación sin guard ────────────────────────────────────────
         with self.lock:
             pos = self.positions.get(symbol)
@@ -1344,6 +1582,8 @@ class TradingBot:
                 return
             pnl      = pos.unrealized_pnl(price)
             notional = pos.notional
+            if not pos.sl_is_manual:
+                pos.sl_usd = self.adaptive_sl.effective_sl(len(pos.fills))
             sl_usd   = pos.sl_usd
 
         if pnl > sl_usd:
@@ -1361,12 +1601,17 @@ class TradingBot:
                     return
                 pnl      = pos.unrealized_pnl(price)
                 notional = pos.notional
+                if not pos.sl_is_manual:
+                    pos.sl_usd = self.adaptive_sl.effective_sl(len(pos.fills))
                 sl_usd   = pos.sl_usd
                 if pnl > sl_usd:
                     return
                 qty      = pos.qty
                 avg_ent  = pos.avg_entry
                 trade_id = pos.trade_id
+                mae_usd  = pos.mae_usd
+                mfe_usd  = pos.mfe_usd
+                n_levels = len(pos.fills)
 
             try:
                 await self.client.close_short(symbol, qty)
@@ -1400,8 +1645,16 @@ class TradingBot:
                         "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                         "unblock_at":  unblock_str,
                         "reason":      "SL",
+                        "mae_usd":     mae_usd,
+                        "mfe_usd":     mfe_usd,
+                        "sl_used":     sl_usd,
                     })
                     self.closed_trades = self.closed_trades[:500]
+
+            self.adaptive_sl.add_trade(
+                symbol=symbol, reason="SL", mae_usd=mae_usd, mfe_usd=mfe_usd,
+                n_levels=n_levels, notional=notional, pnl=pnl,
+            )
 
             self.executor.notify_close(
                 trade_id=trade_id,
@@ -1428,8 +1681,9 @@ class TradingBot:
             pos = self.positions.get(symbol)
             if not pos or pos.status != "OPEN":
                 return False
-            pos.sl_usd = sl_usd
-        self.log(f"Stop loss actualizado para {symbol}: {sl_usd:.4f} USD")
+            pos.sl_usd      = sl_usd
+            pos.sl_is_manual = True  # deja de recalcularse con el motor adaptativo
+        self.log(f"Stop loss actualizado manualmente para {symbol}: {sl_usd:.4f} USD")
         self.persist_state()
         return True
 
@@ -1447,6 +1701,7 @@ class TradingBot:
                 avg_ent  = pos.avg_entry
                 notional = pos.notional
                 trade_id = pos.trade_id
+                n_levels = len(pos.fills)
 
             price = 0.0
             try:
@@ -1454,6 +1709,11 @@ class TradingBot:
                     price = self.price_cache.get_all_prices().get(symbol, 0.0)
             except Exception:
                 pass
+
+            # Última actualización de MAE/MFE con el precio de cierre, por si
+            # el cierre manual ocurre en un extremo no capturado aún.
+            if price > 0:
+                self._track_excursion(symbol, price)
 
             try:
                 await self.client.close_short(symbol, qty)
@@ -1464,6 +1724,8 @@ class TradingBot:
 
             pnl = 0.0
             unblock_str = ""
+            mae_usd = 0.0
+            mfe_usd = 0.0
             with self.lock:
                 pos = self.positions.pop(symbol, None)
                 if pos:
@@ -1471,6 +1733,8 @@ class TradingBot:
                     pos.status       = "CLOSED"
                     pos.realized_pnl = pnl
                     self.total_realized_pnl += pnl
+                    mae_usd      = pos.mae_usd
+                    mfe_usd      = pos.mfe_usd
 
                     unblock_ts  = time.time() + COOLDOWN_SECONDS
                     self.symbol_cooldown[symbol] = unblock_ts
@@ -1489,8 +1753,17 @@ class TradingBot:
                         "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                         "unblock_at":  unblock_str,
                         "reason":      "MANUAL",
+                        "mae_usd":     mae_usd,
+                        "mfe_usd":     mfe_usd,
                     })
                     self.closed_trades = self.closed_trades[:500]
+
+            # No alimenta el cálculo del SL adaptativo (solo se usan los TP),
+            # pero se guarda en el histórico como referencia.
+            self.adaptive_sl.add_trade(
+                symbol=symbol, reason="MANUAL", mae_usd=mae_usd, mfe_usd=mfe_usd,
+                n_levels=n_levels, notional=notional, pnl=pnl,
+            )
 
             self.executor.notify_close(
                 trade_id=trade_id,
@@ -1577,6 +1850,9 @@ class TradingBot:
                 "unrealized_pnl": pnl,
                 "stop_loss_price": sl_price,
                 "stop_loss_usd":   pos.sl_usd,
+                "sl_is_manual":   pos.sl_is_manual,
+                "mae_usd":        pos.mae_usd,
+                "mfe_usd":        pos.mfe_usd,
                 "trade_id":       pos.trade_id,
                 "fills":          [f.__dict__ for f in pos.fills],
                 "change":         next(
@@ -1646,6 +1922,7 @@ class TradingBot:
             "entry_notionals":   ENTRY_NOTIONALS,
             "take_profit_pct":   TAKE_PROFIT_FRACTION * 100,
             "default_stop_loss_usd": DEFAULT_STOP_LOSS_USD,
+            "adaptive_sl":       self.adaptive_sl.stats_summary(),
             "total_unrealized":   total_unreal,
             "total_realized_pnl": total_realized_pnl,
             "total_notional":    total_notional,
@@ -1990,11 +2267,13 @@ HTML = r"""<!doctype html>
       <thead><tr>
         <th>Símbolo</th><th>Cambio 24h (WS)</th><th>Entrada media</th>
         <th>Precio WS</th><th>Notional</th><th>Objetivo TP</th>
-        <th>Stop Loss (precio)</th><th>Stop Loss (USD)</th><th>PnL tiempo real</th><th>Tramos</th>
+        <th>Stop Loss (precio)</th><th>Stop Loss (USD)</th><th>PnL tiempo real</th>
+        <th>Máx. contra (MAE)</th><th>Máx. a favor (MFE)</th>
+        <th>Tramos</th>
         <th>Cerrar</th>
       </tr></thead>
       <tbody id="tbPositions">
-        <tr><td colspan="11" style="color:var(--muted)">Sin posiciones</td></tr>
+        <tr><td colspan="13" style="color:var(--muted)">Sin posiciones</td></tr>
       </tbody>
     </table>
   </section>
@@ -2028,14 +2307,16 @@ HTML = r"""<!doctype html>
     <h2>Operaciones cerradas
       <span id="totalRealizedBadge" style="margin-left:10px;font-size:13px;font-weight:400"></span>
     </h2>
+    <div id="adaptiveSlBadge" style="color:var(--muted);font-size:12px;margin-bottom:8px"></div>
     <table>
       <thead><tr>
         <th>Símbolo</th><th>Motivo</th><th>PnL realizado</th><th>Objetivo TP</th>
         <th>Entrada media</th><th>Precio cierre</th>
+        <th>Máx. contra (MAE)</th><th>Máx. a favor (MFE)</th>
         <th>Bloqueado hasta</th><th>Fecha cierre</th>
       </tr></thead>
       <tbody id="tbClosed">
-        <tr><td colspan="8" style="color:var(--muted)">Sin cierres aún</td></tr>
+        <tr><td colspan="10" style="color:var(--muted)">Sin cierres aún</td></tr>
       </tbody>
     </table>
   </section>
@@ -2257,6 +2538,10 @@ function render(d) {
       .map(f => `<span class="pill">+${fx(f.level,0)}% / ${fx(f.notional,2)}</span>`)
       .join(' ');
     const slUsd = n(p.stop_loss_usd);
+    const maeVal = n(p.mae_usd);
+    const mfeVal = n(p.mfe_usd);
+    const slBadgeIcon = p.sl_is_manual ? '🔒' : '🧠';
+    const slBadgeTitle = p.sl_is_manual ? 'SL manual' : 'SL adaptativo';
     return `<tr>
       <td><a class="sym-link" href="https://www.binance.com/en/futures/${p.symbol}"
              target="_blank">${p.symbol}</a></td>
@@ -2267,14 +2552,16 @@ function render(d) {
       <td class="positive">${money(p.target)}</td>
       <td ${slCls}><span class="sl-badge">⛔ ${fx(slPx)}</span></td>
       <td>
-        <button class="btn-close" style="padding:2px 8px"
-                onclick="editStopLoss('${p.symbol}', ${slUsd}, this)">${money(slUsd)}</button>
+        <button class="btn-close" style="padding:2px 8px" title="${slBadgeTitle}"
+                onclick="editStopLoss('${p.symbol}', ${slUsd}, this)">${slBadgeIcon} ${money(slUsd)}</button>
       </td>
       <td class="${cls(pnl)}">${money(pnl)}</td>
+      <td class="negative">${money(maeVal)}</td>
+      <td class="positive">${money(mfeVal)}</td>
       <td>${fills}</td>
       <td><button class="btn-close" onclick="closePosition('${p.symbol}', this)">Cerrar</button></td>
     </tr>`;
-  }), 'Sin posiciones abiertas', 10);
+  }), 'Sin posiciones abiertas', 13);
 
   // ── Ganadores (símbolos activos ≥15%) ────────────────────────────────────
   const winners     = Array.isArray(d.winners) ? d.winners : [];
@@ -2331,6 +2618,25 @@ function render(d) {
       : '';
   }
 
+  // Badge del motor de stop loss adaptativo
+  const asl = d.adaptive_sl || {};
+  const aslEl = q('adaptiveSlBadge');
+  if (aslEl) {
+    const phaseLabel = {
+      'fijo':                       '🔒 Fase fija (aún no hay suficientes datos)',
+      'peor_mae_tp':                '📊 Usando el peor MAE entre operaciones TP',
+      'promedio_10_peores_mae_tp':  '📈 Usando el promedio de los 10 peores MAE (TP)',
+    }[asl.phase] || asl.phase || '—';
+    const toNext = n(asl.trades_to_next_phase);
+    const nextTxt = toNext > 0
+      ? ` · faltan <b>${toNext}</b> operaciones para la siguiente fase`
+      : '';
+    aslEl.innerHTML =
+      `🧠 SL adaptativo: ${phaseLabel} — SL base por posición: ` +
+      `<b class="${cls(n(asl.base_sl_per_position))}">${money(asl.base_sl_per_position)}</b> ` +
+      `(${n(asl.total_closed)} operaciones cerradas, ${n(asl.tp_count)} en TP)${nextTxt}`;
+  }
+
   const reasonLabel = r => {
     if (!r) return '—';
     if (r === 'TP')     return '<span class="reason-tp">✅ TP</span>';
@@ -2341,6 +2647,8 @@ function render(d) {
 
   q('tbClosed').innerHTML = tb(closed.map(t => {
     const pnlVal = n(t.pnl);
+    const maeVal = t.mae_usd !== undefined ? n(t.mae_usd) : null;
+    const mfeVal = t.mfe_usd !== undefined ? n(t.mfe_usd) : null;
     return `<tr>
       <td style="font-weight:700">${t.symbol || ''}</td>
       <td>${reasonLabel(t.reason)}</td>
@@ -2348,10 +2656,12 @@ function render(d) {
       <td>${money(t.target)}</td>
       <td>${fx(t.avg_entry)}</td>
       <td>${fx(t.close_price)}</td>
+      <td class="negative">${maeVal !== null ? money(maeVal) : '—'}</td>
+      <td class="positive">${mfeVal !== null ? money(mfeVal) : '—'}</td>
       <td style="color:var(--orange)">${t.unblock_at || '—'}</td>
       <td style="color:var(--muted)">${t.closed_at || ''}</td>
     </tr>`;
-  }), 'Sin cierres aún', 8);
+  }), 'Sin cierres aún', 10);
 
   q('events').textContent = (Array.isArray(d.events) ? d.events : []).join('\n');
 }
