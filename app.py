@@ -250,6 +250,28 @@ GLOBAL_SL_CAP_USD     = float(os.getenv("GLOBAL_SL_CAP_USD",     "-6.0"))
 SL_NOTIONAL_FACTOR    = float(os.getenv("SL_NOTIONAL_FACTOR",    "0.3"))
 DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-6.0"))
 
+# Restricción especial para la posición 1 (un único tramo/fill abierto):
+# el stop loss de esa posición nunca puede representar una pérdida mayor
+# a este valor (en USD, positivo). Ej.: con notional=5 y SL_NOTIONAL_FACTOR
+# el cálculo normal daría -1.5, pero con esta restricción se limita a -1.0.
+# En cuanto se abre el segundo tramo, deja de aplicarse esta restricción y
+# vuelve a regir la fórmula normal (sl_usd = max(GLOBAL_SL_CAP_USD, -(notional*factor))).
+FIRST_POSITION_SL_CAP_USD = float(os.getenv("FIRST_POSITION_SL_CAP_USD", "1.0"))
+
+# ── Condición especial para abrir la 3ra posición (3er tramo short) ──────────
+# Antes de abrir el 3er tramo de una posición, se exige que el MFE (máximo
+# a favor, en USD) alcanzado hasta ese momento sea al menos este porcentaje
+# del notional actualmente abierto (suma de los 2 primeros tramos). Si no se
+# alcanzó, en lugar de abrir el 3er short se abre una cobertura LONG (ver
+# THIRD_LEVEL_HEDGE_TP_FRACTION más abajo).
+THIRD_LEVEL_MFE_FRACTION = float(os.getenv("THIRD_LEVEL_MFE_FRACTION", "0.025"))
+
+# TP de la cobertura LONG que se abre cuando no se cumple la condición de
+# MFE anterior: notional igual al que hubiera tenido el 3er tramo short,
+# TP = este % del notional de esa cobertura, SL = precio promedio de
+# entrada del short (la posición que provocó el intento de apertura).
+THIRD_LEVEL_HEDGE_TP_FRACTION = float(os.getenv("THIRD_LEVEL_HEDGE_TP_FRACTION", "0.20"))
+
 # ── Executor externo ──────────────────────────────────────────────────────────
 EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
@@ -269,12 +291,37 @@ class Fill:
 
 
 @dataclass
+class LongHedge:
+    """Cobertura LONG abierta en lugar del 3er tramo short cuando no se
+    cumplió la condición de MFE mínimo (ver THIRD_LEVEL_MFE_FRACTION).
+
+    - notional / qty / entry_price: de la cobertura LONG en sí.
+    - tp_target_usd: ganancia objetivo en USD (notional * THIRD_LEVEL_HEDGE_TP_FRACTION).
+    - sl_price: precio al que se cierra con pérdida = precio promedio de
+      entrada del short que provocó la apertura de esta cobertura.
+    """
+    notional:      float
+    qty:           float
+    entry_price:   float
+    sl_price:      float
+    tp_target_usd: float
+    level:         float = 0.0
+    opened_at:     float = field(default_factory=time.time)
+
+
+@dataclass
 class BotPosition:
     symbol:       str
     fills:        List[Fill] = field(default_factory=list)
     realized_pnl: float = 0.0
     status:       str   = "OPEN"
     trade_id:     int   = 0
+    # Nivel (ENTRY_LEVELS) en el que se decidió abrir una cobertura LONG en
+    # vez del 3er tramo short (porque no se alcanzó el MFE mínimo exigido).
+    # Se guarda para no re-evaluar/reintentar ese mismo nivel en cada scan.
+    hedge_level:  Optional[float] = None
+    # Cobertura LONG activa (si se abrió). None si no aplica o ya se cerró.
+    long_hedge:   Optional["LongHedge"] = None
     # Stop loss configurable en USD (pérdida absoluta, valor negativo).
     # Por defecto toma DEFAULT_STOP_LOSS_USD, pero puede sobreescribirse
     sl_usd:       float = DEFAULT_STOP_LOSS_USD
@@ -418,6 +465,41 @@ class BinanceFuturesClient:
              "quantity": qty, "reduceOnly": "true"},
             signed=True, timeout=10)
 
+    async def market_long(self, symbol: str, notional: float, price: float) -> float:
+        """Abre una cobertura LONG (BUY) — usada cuando no se cumple la
+        condición de MFE mínimo para el 3er tramo short (ver
+        THIRD_LEVEL_MFE_FRACTION).
+
+        NOTA: en modo LIVE (no PAPER) esto envía una orden BUY normal. Si la
+        cuenta está en modo "One-way" (no Hedge Mode) de Binance Futures y ya
+        hay un SHORT abierto en `symbol`, esta orden REDUCIRÁ/NETEARÁ ese
+        short en vez de crear una posición LONG independiente. Para que la
+        cobertura LONG coexista con el short hay que activar Hedge Mode en
+        la cuenta de Binance (y pasar positionSide=LONG/SHORT en las
+        órdenes). En PAPER_MODE (por defecto) esto no aplica: el bot solo
+        simula qty/PnL internamente."""
+        min_notional = self.exchange_filters.get(symbol, {}).get("minNotional", 5.0)
+        effective    = max(notional, min_notional)
+        qty          = self.normalize_qty(symbol, effective / price)
+        if qty <= 0:
+            raise RuntimeError(f"Qty inválida {symbol}: notional={effective} price={price}")
+        if PAPER_MODE or not LIVE_TRADING:
+            return qty
+        await self.set_leverage(symbol)
+        await self.request("POST", "/fapi/v1/order",
+            {"symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": qty},
+            signed=True)
+        return qty
+
+    async def close_long(self, symbol: str, qty: float) -> None:
+        qty = self.normalize_qty(symbol, qty)
+        if qty <= 0 or PAPER_MODE or not LIVE_TRADING:
+            return
+        await self.request("POST", "/fapi/v1/order",
+            {"symbol": symbol, "side": "SELL", "type": "MARKET",
+             "quantity": qty, "reduceOnly": "true"},
+            signed=True, timeout=10)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MOTOR DE STOP LOSS ADAPTATIVO (basado en MAE / MFE histórico)
@@ -543,7 +625,7 @@ class AdaptiveStopLossEngine:
             if r.get("reason") == "TP" and isinstance(r.get("mae_per_position"), (int, float))
         ]
 
-    def effective_sl(self, notional: float) -> float:
+    def effective_sl(self, notional: float, n_fills: int = 0) -> float:
         """SL efectivo (USD, negativo) para una posición dado su notional
         total abierto en este momento (suma de todos sus tramos/niveles).
 
@@ -556,9 +638,18 @@ class AdaptiveStopLossEngine:
         es el TECHO de pérdida: nunca se permite un SL más negativo que ese
         valor (p.ej. notional=40 -> -12 en teoría, pero se limita a -6, que
         es la pérdida máxima que se está dispuesto a asumir por posición).
+
+        Restricción adicional: mientras la posición tenga un único tramo
+        abierto (n_fills == 1, "posición 1"), la pérdida nunca puede superar
+        FIRST_POSITION_SL_CAP_USD (por defecto 1.0 USD), sin importar lo que
+        dé la fórmula normal. Para 2 o más tramos abiertos, esta restricción
+        no aplica y rige la fórmula normal de siempre.
         """
         candidate = -abs(float(notional)) * self.notional_factor
-        return max(self.global_cap_usd, candidate)
+        sl_usd    = max(self.global_cap_usd, candidate)
+        if n_fills == 1:
+            sl_usd = max(sl_usd, -abs(FIRST_POSITION_SL_CAP_USD))
+        return sl_usd
 
     def stats_summary(self) -> dict:
         total   = self.total_closed
@@ -1291,14 +1382,19 @@ class TradingBot:
 
                     kline_ok = self._kline_entry_ok(symbol)
 
-                    for level, notional in zip(ENTRY_LEVELS, ENTRY_NOTIONALS):
+                    for idx, (level, notional) in enumerate(zip(ENTRY_LEVELS, ENTRY_NOTIONALS)):
                         if change >= level and kline_ok:
-                            await self._ensure_short(symbol, level, notional, price, change)
+                            if idx == 2:
+                                # 3er tramo: sujeto a la condición de MFE mínimo
+                                await self._ensure_third_or_hedge(symbol, level, notional, price, change)
+                            else:
+                                await self._ensure_short(symbol, level, notional, price, change)
 
                     self._track_excursion(symbol, price)
                     self._maybe_breakeven(symbol, price)
                     await self._maybe_stop_loss(symbol, price)
                     await self._maybe_take_profit(symbol, price)
+                    await self._maybe_hedge_tp_sl(symbol, price)
 
                 # TP/SL de posiciones que ya no están en winners
                 with self.lock:
@@ -1312,6 +1408,7 @@ class TradingBot:
                             self._maybe_breakeven(symbol, price)
                             await self._maybe_stop_loss(symbol, price)
                             await self._maybe_take_profit(symbol, price)
+                            await self._maybe_hedge_tp_sl(symbol, price)
 
                 with self.lock:
                     self.scan_count  += 1
@@ -1366,6 +1463,7 @@ class TradingBot:
                             self._maybe_breakeven(symbol, price)
                             await self._maybe_stop_loss(symbol, price)
                             await self._maybe_take_profit(symbol, price)
+                            await self._maybe_hedge_tp_sl(symbol, price)
                         # Ceder el event loop en cada símbolo para no bloquearlo
                         await asyncio.sleep(0)
             except asyncio.CancelledError:
@@ -1465,6 +1563,193 @@ class TradingBot:
             self.last_error = str(exc)
             self.log(f"Error abriendo short {symbol} nivel {level}: {exc}")
 
+    async def _ensure_third_or_hedge(self, symbol: str, level: float, notional: float,
+                                      price: float, change: float) -> None:
+        """Gate para el 3er tramo short (ENTRY_LEVELS[2]).
+
+        Condición: para abrir el 3er tramo, el MFE (máximo a favor, en USD)
+        alcanzado hasta ahora por la posición debe ser >= THIRD_LEVEL_MFE_FRACTION
+        (2.5% por defecto) del notional actualmente abierto (suma de los 2
+        primeros tramos).
+
+        - Si se cumple: se abre el 3er short normalmente (_ensure_short).
+        - Si NO se cumple: no se abre el 3er short. En su lugar se abre una
+          cobertura LONG con el mismo notional que hubiera tenido ese 3er
+          tramo, TP = THIRD_LEVEL_HEDGE_TP_FRACTION (20%) de ese notional, y
+          SL en el precio promedio de entrada del short actual (la posición
+          que provocó este intento de apertura).
+
+        Cualquiera de los dos caminos "consume" este nivel: no se vuelve a
+        evaluar en escaneos posteriores (pos.opened_levels() / hedge_level)."""
+        with self.lock:
+            pos = self.positions.get(symbol)
+            already_handled = bool(
+                pos and (level in pos.opened_levels() or pos.hedge_level == level)
+            )
+            # Si aún no hay al menos 2 tramos abiertos, este "3er nivel" en
+            # realidad sería el 1º o 2º tramo (p.ej. tras un restart con
+            # estado limpio) — se comporta como una apertura normal.
+            not_yet_third = not pos or len(pos.fills) < 2
+
+        if already_handled:
+            return
+        if not_yet_third:
+            await self._ensure_short(symbol, level, notional, price, change)
+            return
+
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN":
+                return
+            mfe_required = pos.notional * THIRD_LEVEL_MFE_FRACTION
+            mfe_ok       = pos.mfe_usd >= mfe_required
+            entry_ref    = pos.avg_entry
+            mfe_snapshot = pos.mfe_usd
+
+        if mfe_ok:
+            await self._ensure_short(symbol, level, notional, price, change)
+        else:
+            self.log(
+                f"⚠️ {symbol}: MFE={mfe_snapshot:.4f} < {THIRD_LEVEL_MFE_FRACTION*100:.1f}% "
+                f"del notional (req={mfe_required:.4f}) — no se abre 3ra posición short, "
+                f"se abre cobertura LONG en su lugar"
+            )
+            await self._open_long_hedge(symbol, level, notional, price, entry_ref)
+
+    async def _open_long_hedge(self, symbol: str, level: float, notional: float,
+                                price: float, sl_price: float) -> None:
+        """Abre la cobertura LONG sustituta del 3er tramo short (ver
+        _ensure_third_or_hedge)."""
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN":
+                return
+            if level in pos.opened_levels() or pos.hedge_level is not None:
+                return
+            pos.hedge_level = level  # marca este nivel como "consumido" ya
+
+        try:
+            qty       = await self.client.market_long(symbol, notional, price)
+            tp_target = notional * THIRD_LEVEL_HEDGE_TP_FRACTION
+            hedge = LongHedge(
+                notional=notional, qty=qty, entry_price=price,
+                sl_price=sl_price, tp_target_usd=tp_target, level=level,
+            )
+            with self.lock:
+                pos2 = self.positions.get(symbol)
+                if pos2:
+                    pos2.long_hedge = hedge
+                trade_id = pos2.trade_id if pos2 else 0
+
+            self.log(
+                f"🔀 HEDGE LONG {symbol}: {notional:.2f} USDT | qty={qty} | "
+                f"entrada={price:.6f} | TP objetivo={tp_target:.4f} USD | "
+                f"SL px={sl_price:.6f} | trade_id={trade_id}"
+            )
+            self.executor.notify_open(
+                trade_id=trade_id, symbol=symbol, direction="LONG",
+                price=price, quantity=qty, notional=notional, level=level,
+            )
+            self.persist_state()
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.log(f"Error abriendo cobertura LONG {symbol} nivel {level}: {exc}")
+
+    async def _maybe_hedge_tp_sl(self, symbol: str, price: float) -> None:
+        """Gestiona TP/SL de la cobertura LONG (si existe) abierta en lugar
+        del 3er tramo short.
+
+        TP: PnL no realizado del long (price - entry_price) * qty alcanza
+        el objetivo tp_target_usd (notional * THIRD_LEVEL_HEDGE_TP_FRACTION).
+        SL: el precio de mercado cae a/por debajo de sl_price (el precio
+        promedio de entrada del short que provocó la apertura de la
+        cobertura)."""
+        if price <= 0:
+            return
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.long_hedge:
+                return
+            hedge  = pos.long_hedge
+            pnl    = (price - hedge.entry_price) * hedge.qty
+            hit_tp = pnl >= hedge.tp_target_usd
+            hit_sl = price <= hedge.sl_price
+            if not hit_tp and not hit_sl:
+                return
+            qty      = hedge.qty
+            reason   = "HEDGE_TP" if hit_tp else "HEDGE_SL"
+            trade_id = pos.trade_id
+
+        try:
+            await self.client.close_long(symbol, qty)
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.log(f"Error cerrando cobertura LONG {symbol}: {exc}")
+            return
+
+        with self.lock:
+            pos = self.positions.get(symbol)
+            closed_hedge = pos.long_hedge if pos else None
+            if pos and closed_hedge:
+                pos.long_hedge = None
+                self.total_realized_pnl += pnl
+                self.closed_trades.insert(0, {
+                    "symbol":      symbol,
+                    "pnl":         pnl,
+                    "target":      closed_hedge.tp_target_usd,
+                    "qty":         qty,
+                    "avg_entry":   closed_hedge.entry_price,
+                    "close_price": price,
+                    "notional":    closed_hedge.notional,
+                    "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "reason":      reason,
+                    "direction":   "LONG",
+                })
+                self.closed_trades = self.closed_trades[:500]
+
+        self.executor.notify_close(
+            trade_id=trade_id, symbol=symbol, direction="LONG",
+            reason=reason, close_price=price, pnl=pnl,
+        )
+        icon = "🟢" if hit_tp else "⛔"
+        self.log(
+            f"{icon} {reason} cobertura LONG {symbol}: PnL={pnl:.4f} | px={price:.6f}"
+        )
+        self.persist_state()
+
+    async def _force_close_hedge(self, symbol: str, hedge: "LongHedge",
+                                  price: float, reason: str) -> None:
+        """Cierra una cobertura LONG huérfana porque el short asociado
+        (pos) acaba de cerrarse (TP/SL/manual) y se removió de
+        self.positions. Evita dejar la cobertura abierta sin seguimiento."""
+        close_price = price if price > 0 else hedge.entry_price
+        try:
+            await self.client.close_long(symbol, hedge.qty)
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.log(f"Error cerrando cobertura LONG huérfana {symbol}: {exc}")
+            return
+        pnl = (close_price - hedge.entry_price) * hedge.qty
+        with self.lock:
+            self.total_realized_pnl += pnl
+            self.closed_trades.insert(0, {
+                "symbol":      symbol,
+                "pnl":         pnl,
+                "target":      hedge.tp_target_usd,
+                "qty":         hedge.qty,
+                "avg_entry":   hedge.entry_price,
+                "close_price": close_price,
+                "notional":    hedge.notional,
+                "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "reason":      reason,
+                "direction":   "LONG",
+            })
+            self.closed_trades = self.closed_trades[:500]
+        self.log(
+            f"🔀 Cobertura LONG {symbol} cerrada junto con el short ({reason}): "
+            f"PnL={pnl:.4f} | px={close_price:.6f}"
+        )
+
     def _track_excursion(self, symbol: str, price: float) -> None:
         """Actualiza MAE (peor PnL no realizado) y MFE (mejor PnL no
         realizado) de la posición abierta en `symbol` con el precio actual.
@@ -1555,12 +1840,14 @@ class TradingBot:
                 return
 
             unblock_str = ""
+            hedge_to_close = None
             with self.lock:
                 pos = self.positions.pop(symbol, None)
                 if pos:
                     pos.status       = "CLOSED"
                     pos.realized_pnl = pnl
                     self.total_realized_pnl += pnl
+                    hedge_to_close   = pos.long_hedge
 
                     unblock_ts  = time.time() + COOLDOWN_SECONDS
                     self.symbol_cooldown[symbol] = unblock_ts
@@ -1583,6 +1870,9 @@ class TradingBot:
                         "mfe_usd":     mfe_usd,
                     })
                     self.closed_trades = self.closed_trades[:500]
+
+            if hedge_to_close:
+                await self._force_close_hedge(symbol, hedge_to_close, price, "HEDGE_TP_PARENT")
 
             # Solo las operaciones que llegan a TP alimentan el cálculo del
             # stop loss adaptativo (ver AdaptiveStopLossEngine).
@@ -1617,7 +1907,10 @@ class TradingBot:
         que ese cálculo lo superaría. Si el usuario fijó el SL manualmente
         para este símbolo (pos.sl_is_manual), se respeta ese valor fijo en
         su lugar. Si el SL ya se movió a breakeven (pos.sl_breakeven, ver
-        _maybe_breakeven), tampoco se recalcula: se queda fijo en $0.00."""
+        _maybe_breakeven), tampoco se recalcula: se queda fijo en $0.00.
+
+        Mientras la posición tenga un único tramo abierto ("posición 1"),
+        el SL nunca supera FIRST_POSITION_SL_CAP_USD (ver effective_sl)."""
         # ── Pre-verificación sin guard ────────────────────────────────────────
         with self.lock:
             pos = self.positions.get(symbol)
@@ -1626,7 +1919,7 @@ class TradingBot:
             pnl      = pos.unrealized_pnl(price)
             notional = pos.notional
             if not pos.sl_is_manual and not pos.sl_breakeven:
-                pos.sl_usd = self.adaptive_sl.effective_sl(notional)
+                pos.sl_usd = self.adaptive_sl.effective_sl(notional, n_fills=len(pos.fills))
             sl_usd   = pos.sl_usd
 
         if pnl > sl_usd:
@@ -1645,7 +1938,7 @@ class TradingBot:
                 pnl      = pos.unrealized_pnl(price)
                 notional = pos.notional
                 if not pos.sl_is_manual and not pos.sl_breakeven:
-                    pos.sl_usd = self.adaptive_sl.effective_sl(notional)
+                    pos.sl_usd = self.adaptive_sl.effective_sl(notional, n_fills=len(pos.fills))
                 sl_usd   = pos.sl_usd
                 if pnl > sl_usd:
                     return
@@ -1667,12 +1960,14 @@ class TradingBot:
             reason = "BE" if is_breakeven else "SL"
 
             unblock_str = ""
+            hedge_to_close = None
             with self.lock:
                 pos = self.positions.pop(symbol, None)
                 if pos:
                     pos.status       = "CLOSED"
                     pos.realized_pnl = pnl
                     self.total_realized_pnl += pnl
+                    hedge_to_close   = pos.long_hedge
 
                     unblock_ts  = time.time() + COOLDOWN_SECONDS
                     self.symbol_cooldown[symbol] = unblock_ts
@@ -1696,6 +1991,9 @@ class TradingBot:
                         "sl_used":     sl_usd,
                     })
                     self.closed_trades = self.closed_trades[:500]
+
+            if hedge_to_close:
+                await self._force_close_hedge(symbol, hedge_to_close, price, f"HEDGE_{reason}_PARENT")
 
             self.adaptive_sl.add_trade(
                 symbol=symbol, reason=reason, mae_usd=mae_usd, mfe_usd=mfe_usd,
@@ -1775,6 +2073,7 @@ class TradingBot:
             unblock_str = ""
             mae_usd = 0.0
             mfe_usd = 0.0
+            hedge_to_close = None
             with self.lock:
                 pos = self.positions.pop(symbol, None)
                 if pos:
@@ -1784,6 +2083,7 @@ class TradingBot:
                     self.total_realized_pnl += pnl
                     mae_usd      = pos.mae_usd
                     mfe_usd      = pos.mfe_usd
+                    hedge_to_close = pos.long_hedge
 
                     unblock_ts  = time.time() + COOLDOWN_SECONDS
                     self.symbol_cooldown[symbol] = unblock_ts
@@ -1806,6 +2106,9 @@ class TradingBot:
                         "mfe_usd":     mfe_usd,
                     })
                     self.closed_trades = self.closed_trades[:500]
+
+            if hedge_to_close:
+                await self._force_close_hedge(symbol, hedge_to_close, price, "HEDGE_MANUAL_PARENT")
 
             # No alimenta el cálculo del SL adaptativo (solo se usan los TP),
             # pero se guarda en el histórico como referencia.
@@ -1904,6 +2207,7 @@ class TradingBot:
                 "mfe_usd":        pos.mfe_usd,
                 "trade_id":       pos.trade_id,
                 "fills":          [f.__dict__ for f in pos.fills],
+                "long_hedge":     (pos.long_hedge.__dict__ if pos.long_hedge else None),
                 "change":         next(
                     (w["change"] for w in winners_raw if w["symbol"] == symbol), 0.0
                 ),
