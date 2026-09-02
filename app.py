@@ -223,25 +223,21 @@ MAX_PRICE_BLOCK = float(os.getenv("MAX_PRICE_BLOCK", "1.5"))
 
 ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150,200,250").split(",")]
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
-TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.1428"))
+TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.125")) #"0.1428"
 
-# Cuando el PnL no realizado de una posición alcanza este porcentaje de su
-# objetivo de TP (pos.notional * TAKE_PROFIT_FRACTION), el SL se mueve a
-# breakeven (0 USD) para proteger la ganancia acumulada. No se aplica si el
-# usuario fijó el SL manualmente para esa posición.
-BREAKEVEN_TP_FRACTION = float(os.getenv("BREAKEVEN_TP_FRACTION", "0.83"))
-
-# Stop loss GLOBAL en USD (pérdida absoluta, valor negativo).
+# Stop loss en USD (pérdida absoluta, valor negativo).
 #
 # Regla fijada por el usuario:
-#   - Para posiciones con notional pequeño, el SL se calcula como
-#     -(notional * SL_NOTIONAL_FACTOR). Ej.: notional=5 -> -1.5,
+#   - Para TODAS las posiciones, desde la primera hasta la última, el SL se
+#     calcula como -(notional * SL_NOTIONAL_FACTOR). Ej.: notional=5 -> -1.5,
 #     notional=10 -> -3, notional=20 -> -6.
-#   - -6 USD es el TECHO de pérdida: la pérdida MÁXIMA que se está
-#     dispuesto a asumir por posición. En cuanto -(notional * factor)
-#     superaría ese valor (sería más negativo que -6, p.ej. notional=40
-#     -> -12), el SL se limita a -6 USD y ya no crece más.
+#   - GLOBAL_SL_CAP_USD (por defecto -6 USD) es el TECHO de pérdida: la
+#     pérdida MÁXIMA que se está dispuesto a asumir por posición. En cuanto
+#     -(notional * factor) superaría ese valor (sería más negativo que -6,
+#     p.ej. notional=40 -> -12), el SL se limita a -6 USD y ya no crece más.
 #   - En resumen:  sl_usd = max(GLOBAL_SL_CAP_USD, -(notional * SL_NOTIONAL_FACTOR))
+#   - Esta fórmula aplica igual a todas las posiciones, desde la primera
+#     hasta la última: no hay ninguna excepción especial para la posición 1.
 #
 # Se aplica a cada posición nueva (recalculado en cada chequeo mientras no
 # se haya fijado manualmente), pero puede sobreescribirse individualmente
@@ -249,14 +245,6 @@ BREAKEVEN_TP_FRACTION = float(os.getenv("BREAKEVEN_TP_FRACTION", "0.83"))
 GLOBAL_SL_CAP_USD     = float(os.getenv("GLOBAL_SL_CAP_USD",     "-6.0"))
 SL_NOTIONAL_FACTOR    = float(os.getenv("SL_NOTIONAL_FACTOR",    "0.3"))
 DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-6.0"))
-
-# Restricción especial para la posición 1 (un único tramo/fill abierto):
-# el stop loss de esa posición nunca puede representar una pérdida mayor
-# a este valor (en USD, positivo). Ej.: con notional=5 y SL_NOTIONAL_FACTOR
-# el cálculo normal daría -1.5, pero con esta restricción se limita a -1.0.
-# En cuanto se abre el segundo tramo, deja de aplicarse esta restricción y
-# vuelve a regir la fórmula normal (sl_usd = max(GLOBAL_SL_CAP_USD, -(notional*factor))).
-FIRST_POSITION_SL_CAP_USD = float(os.getenv("FIRST_POSITION_SL_CAP_USD", "1.0"))
 
 # ── Condición especial para abrir la 3ra posición (3er tramo short) ──────────
 # Antes de abrir el 3er tramo de una posición, se exige que el MFE (máximo
@@ -328,11 +316,6 @@ class BotPosition:
     # True si el usuario fijó el SL manualmente desde el dashboard: en ese
     # caso el motor adaptativo deja de recalcular sl_usd para esta posición.
     sl_is_manual: bool  = False
-    # True una vez que el SL se movió a breakeven (0 USD) porque la posición
-    # superó el 83% de su objetivo de TP. A partir de entonces el motor
-    # automático deja de recalcular sl_usd hacia abajo (se protege la
-    # ganancia). Se resetea si el usuario vuelve a fijar el SL manualmente.
-    sl_breakeven: bool  = False
 
     # ── MAE / MFE (Maximum Adverse / Favorable Excursion) ──────────────────
     # Se actualizan en cada chequeo de precio mientras la posición está
@@ -510,17 +493,21 @@ class AdaptiveStopLossEngine:
     Calcula el stop loss (SL) efectivo de una posición y conserva, además,
     un histórico MAE/MFE de las operaciones cerradas para referencia.
 
-    Regla de SL GLOBAL (fijada por el usuario):
-      - Para posiciones con notional pequeño, el SL se calcula como
-        -(notional * notional_factor) (por defecto notional_factor = 0.3).
-        Ej.: notional=5 -> -1.5, notional=10 -> -3, notional=20 -> -6.
+    Regla de SL (fijada por el usuario):
+      - Para TODAS las posiciones, desde la primera hasta la última, el SL
+        se calcula como -(notional * notional_factor) (por defecto
+        notional_factor = 0.3). Ej.: notional=5 -> -1.5, notional=10 -> -3,
+        notional=20 -> -6.
       - `global_cap_usd` (por defecto -6 USD) es el TECHO de pérdida: la
         pérdida MÁXIMA que se está dispuesto a asumir por posición. En
         cuanto -(notional * notional_factor) superaría ese valor (sería más
-        negativo que -6, p.ej. notional=40 -> -12), el SL se limita a -6 USD
-        y ya no crece más por mucho que aumente el notional.
+        negativo que -6, p.ej. notional=40 -> -12), el SL se limita a -6
+        USD y ya no crece más por mucho que aumente el notional.
       - En resumen:
             sl_usd = max(global_cap_usd, -(notional * notional_factor))
+      - Esta fórmula aplica igual a todas las posiciones, desde la primera
+        hasta la última: no hay ninguna excepción especial para la
+        posición con un único tramo abierto.
 
     El histórico MAE/MFE de operaciones cerradas (TP/SL/MANUAL) se sigue
     registrando vía add_trade() y queda disponible en stats_summary() como
@@ -629,7 +616,7 @@ class AdaptiveStopLossEngine:
         """SL efectivo (USD, negativo) para una posición dado su notional
         total abierto en este momento (suma de todos sus tramos/niveles).
 
-        Regla global fijada por el usuario:
+        Regla fijada por el usuario:
             sl_usd = max(global_cap_usd, -(notional * notional_factor))
 
         Es decir: para notionales pequeños se usa -(notional * 0.3) (una
@@ -639,17 +626,12 @@ class AdaptiveStopLossEngine:
         valor (p.ej. notional=40 -> -12 en teoría, pero se limita a -6, que
         es la pérdida máxima que se está dispuesto a asumir por posición).
 
-        Restricción adicional: mientras la posición tenga un único tramo
-        abierto (n_fills == 1, "posición 1"), la pérdida nunca puede superar
-        FIRST_POSITION_SL_CAP_USD (por defecto 1.0 USD), sin importar lo que
-        dé la fórmula normal. Para 2 o más tramos abiertos, esta restricción
-        no aplica y rige la fórmula normal de siempre.
+        Esta fórmula se aplica tal cual a TODAS las posiciones, desde la
+        primera hasta la última, sin ninguna excepción especial para la
+        posición con un único tramo abierto.
         """
         candidate = -abs(float(notional)) * self.notional_factor
-        sl_usd    = max(self.global_cap_usd, candidate)
-        if n_fills == 1:
-            sl_usd = max(sl_usd, -abs(FIRST_POSITION_SL_CAP_USD))
-        return sl_usd
+        return max(self.global_cap_usd, candidate)
 
     def stats_summary(self) -> dict:
         total   = self.total_closed
@@ -1391,7 +1373,6 @@ class TradingBot:
                                 await self._ensure_short(symbol, level, notional, price, change)
 
                     self._track_excursion(symbol, price)
-                    self._maybe_breakeven(symbol, price)
                     await self._maybe_stop_loss(symbol, price)
                     await self._maybe_take_profit(symbol, price)
                     await self._maybe_hedge_tp_sl(symbol, price)
@@ -1405,7 +1386,6 @@ class TradingBot:
                         price = all_prices.get(symbol)
                         if price:
                             self._track_excursion(symbol, price)
-                            self._maybe_breakeven(symbol, price)
                             await self._maybe_stop_loss(symbol, price)
                             await self._maybe_take_profit(symbol, price)
                             await self._maybe_hedge_tp_sl(symbol, price)
@@ -1460,7 +1440,6 @@ class TradingBot:
                         price = all_prices.get(symbol)
                         if price and price > 0:
                             self._track_excursion(symbol, price)
-                            self._maybe_breakeven(symbol, price)
                             await self._maybe_stop_loss(symbol, price)
                             await self._maybe_take_profit(symbol, price)
                             await self._maybe_hedge_tp_sl(symbol, price)
@@ -1766,37 +1745,6 @@ class TradingBot:
             if pnl > pos.mfe_usd:
                 pos.mfe_usd = pnl
 
-    def _maybe_breakeven(self, symbol: str, price: float) -> None:
-        """Mueve el SL a breakeven (0 USD) en cuanto el PnL no realizado
-        alcanza BREAKEVEN_TP_FRACTION (83% por defecto) de su objetivo de
-        TP. A partir de ese momento la posición ya no puede cerrarse con
-        pérdida por stop loss: como mucho, cierra en 0.
-
-        No se aplica si el usuario fijó el SL manualmente para este
-        símbolo (pos.sl_is_manual), ni se vuelve a evaluar una vez que ya
-        se activó (pos.sl_breakeven queda en True hasta que se cierre la
-        posición o el usuario fije un SL manual, que resetea el flag)."""
-        if price <= 0:
-            return
-        with self.lock:
-            pos = self.positions.get(symbol)
-            if not pos or pos.status != "OPEN" or not pos.fills:
-                return
-            if pos.sl_is_manual or pos.sl_breakeven:
-                return
-            pnl      = pos.unrealized_pnl(price)
-            target   = pos.notional * TAKE_PROFIT_FRACTION
-            trigger  = target * BREAKEVEN_TP_FRACTION
-            if target <= 0 or pnl < trigger:
-                return
-            pos.sl_usd      = 0.0
-            pos.sl_breakeven = True
-        self.log(
-            f"🟢 Breakeven activado {symbol}: PnL={pnl:.4f} >= "
-            f"{BREAKEVEN_TP_FRACTION*100:.0f}% del objetivo ({trigger:.4f}) — SL movido a $0.00"
-        )
-        self.persist_state()
-
     async def _maybe_take_profit(self, symbol: str, price: float) -> None:
         # ── Pre-verificación sin guard (caso más común: TP no alcanzado) ──────
         # Esto evita bloquear close_position_manual con el guard innecesariamente
@@ -1901,16 +1849,13 @@ class TradingBot:
         """Cierra la posición si la pérdida no realizada >= stop loss
         efectivo para esa posición.
 
-        El stop loss efectivo es, por defecto, el SL GLOBAL calculado por
-        self.adaptive_sl.effective_sl(notional): -(notional * 0.3) para
-        posiciones pequeñas, con -6 USD como TECHO (pérdida máxima) una vez
-        que ese cálculo lo superaría. Si el usuario fijó el SL manualmente
-        para este símbolo (pos.sl_is_manual), se respeta ese valor fijo en
-        su lugar. Si el SL ya se movió a breakeven (pos.sl_breakeven, ver
-        _maybe_breakeven), tampoco se recalcula: se queda fijo en $0.00.
-
-        Mientras la posición tenga un único tramo abierto ("posición 1"),
-        el SL nunca supera FIRST_POSITION_SL_CAP_USD (ver effective_sl)."""
+        El stop loss efectivo se calcula siempre por
+        self.adaptive_sl.effective_sl(notional): -(notional * 0.3), con
+        GLOBAL_SL_CAP_USD (-6 USD por defecto) como techo de pérdida
+        máxima — aplica igual desde la primera hasta la última posición,
+        sin excepción especial para ningún tramo. Si el usuario fijó el SL
+        manualmente para este símbolo (pos.sl_is_manual), se respeta ese
+        valor fijo en su lugar."""
         # ── Pre-verificación sin guard ────────────────────────────────────────
         with self.lock:
             pos = self.positions.get(symbol)
@@ -1918,7 +1863,7 @@ class TradingBot:
                 return
             pnl      = pos.unrealized_pnl(price)
             notional = pos.notional
-            if not pos.sl_is_manual and not pos.sl_breakeven:
+            if not pos.sl_is_manual:
                 pos.sl_usd = self.adaptive_sl.effective_sl(notional, n_fills=len(pos.fills))
             sl_usd   = pos.sl_usd
 
@@ -1937,7 +1882,7 @@ class TradingBot:
                     return
                 pnl      = pos.unrealized_pnl(price)
                 notional = pos.notional
-                if not pos.sl_is_manual and not pos.sl_breakeven:
+                if not pos.sl_is_manual:
                     pos.sl_usd = self.adaptive_sl.effective_sl(notional, n_fills=len(pos.fills))
                 sl_usd   = pos.sl_usd
                 if pnl > sl_usd:
@@ -1948,16 +1893,15 @@ class TradingBot:
                 mae_usd    = pos.mae_usd
                 mfe_usd    = pos.mfe_usd
                 n_levels   = len(pos.fills)
-                is_breakeven = pos.sl_breakeven
 
             try:
                 await self.client.close_short(symbol, qty)
             except Exception as exc:
                 self.last_error = str(exc)
-                self.log(f"Error cerrando {'BREAKEVEN' if is_breakeven else 'STOP LOSS'} {symbol}: {exc}")
+                self.log(f"Error cerrando STOP LOSS {symbol}: {exc}")
                 return
 
-            reason = "BE" if is_breakeven else "SL"
+            reason = "SL"
 
             unblock_str = ""
             hedge_to_close = None
@@ -2008,10 +1952,8 @@ class TradingBot:
                 close_price=price,
                 pnl=pnl,
             )
-            icon = "🟢" if is_breakeven else "⛔"
-            label = "BREAKEVEN" if is_breakeven else "STOP LOSS"
             self.log(
-                f"{icon} {label} {symbol}: PnL={pnl:.4f} | SL configurado={sl_usd:.4f} | "
+                f"⛔ STOP LOSS {symbol}: PnL={pnl:.4f} | SL configurado={sl_usd:.4f} | "
                 f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
             )
             self.persist_state()
@@ -2029,7 +1971,6 @@ class TradingBot:
                 return False
             pos.sl_usd       = sl_usd
             pos.sl_is_manual = True   # deja de recalcularse con el motor automático
-            pos.sl_breakeven = False  # el override manual tiene prioridad sobre el breakeven
         self.log(f"Stop loss actualizado manualmente para {symbol}: {sl_usd:.4f} USD")
         self.persist_state()
         return True
@@ -2661,8 +2602,7 @@ HTML = r"""<!doctype html>
   <section>
     <h2>Posiciones abiertas
       <span style="color:var(--muted);font-size:12px;font-weight:400;margin-left:8px">
-        ⛔ SL configurable por posición (= notional × 0.3, tope máximo $-6.00)
-        &nbsp;|&nbsp; 🟢 breakeven automático al 83% del objetivo TP
+        ⛔ SL configurable por posición (= notional × 0.3, tope máximo $-6.00, para todas las posiciones)
       </span>
     </h2>
     <div class="table-scroll">
@@ -2748,8 +2688,8 @@ HTML = r"""<!doctype html>
     </p>
     <label style="display:block; font-size:12px; color:var(--muted); margin-bottom:6px;">
       Pérdida máxima en USD (valor negativo, ej. -6). El SL automático es
-      notional × 0.3, con -6 USD como tope máximo por posición; aquí puedes
-      fijar cualquier valor negativo manualmente.
+      notional × 0.3, con -6 USD como tope máximo, para todas las
+      posiciones; aquí puedes fijar cualquier valor negativo manualmente.
     </label>
     <input id="slModalInput" type="number" step="0.1"
            style="width:100%; box-sizing:border-box; background:#0f172a; color:var(--txt);
@@ -3035,8 +2975,8 @@ function render(d) {
     const cap    = n(asl.global_cap_usd);
     const factor = n(asl.notional_factor);
     aslEl.innerHTML =
-      `🧠 SL global: = notional × ${factor || '0.3'}, con tope máximo de ` +
-      `<b class="${cls(cap)}">${money(cap)}</b> por posición ` +
+      `🧠 SL: = notional × ${factor || '0.3'}, con tope máximo de ` +
+      `<b class="${cls(cap)}">${money(cap)}</b> por posición, para todas las posiciones ` +
       `(${n(asl.total_closed)} operaciones cerradas, ${n(asl.tp_count)} en TP)`;
   }
 
