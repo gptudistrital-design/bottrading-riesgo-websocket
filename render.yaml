@@ -31,14 +31,30 @@ services:
         value: "true"         # cambiar a "false" solo con API keys reales
       - key: LIVE_TRADING
         value: "false"        # "true" activa órdenes reales (requiere keys)
-      - key: LEVERAGE
-        value: "1"
 
       # ── API Binance (solo necesarias para LIVE_TRADING=true) ───────────────
       # - key: BINANCE_API_KEY
       #   sync: false         # añadir como secret en Render
       # - key: BINANCE_API_SECRET
       #   sync: false
+
+      # ── REST: solo UNA petición (exchangeInfo) al arrancar ──────────────────
+      # Proxy opcional para esa petición. Añádelo como secret en Render
+      # (formato http://usuario:clave@host:puerto), nunca en este archivo.
+      - key: REST_PROXY_URL
+        sync: false
+      - key: SYMBOL_REFRESH_HOURS
+        value: "12"           # caché de exchangeInfo en disco; si es más nuevo, 0 peticiones REST
+
+      # ── Velas solo por WebSocket (una conexión por intervalo) ───────────────
+      - key: KLINE_INTERVALS
+        value: "1m"           # ej. "1m,5m,15m": cada intervalo = 1 conexión con todos los símbolos
+      - key: KLINE_HISTORY
+        value: "2"            # velas cerradas por símbolo (última y penúltima)
+      - key: KLINE_DTYPE
+        value: "float64"      # float32 = mitad de RAM
+      - key: KLINE_ALLOW_NO_DATA
+        value: "false"        # sin vela cerrada reciente no se entra
 
       # ── Endpoints REST ─────────────────────────────────────────────────────
       - key: BASE_URL
