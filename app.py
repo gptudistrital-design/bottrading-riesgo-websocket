@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import atexit
 import concurrent.futures
 import csv
 import hashlib
@@ -11,10 +12,10 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from math import floor
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 import urllib.error
 import urllib.request
@@ -27,6 +28,7 @@ if _HERE not in sys.path:
 
 from WS import SymbolWebSocketPriceCache, _ALL_MARKET_ENABLED  # noqa: E402
 from kline_ws import KlineWebSocketStream                     # noqa: E402
+from state_store import StateStore, backend_from_env, make_owner_id  # noqa: E402
 
 # ── ExecutorBridge (señales al Executor externo) ─────────────────────────────
 
@@ -222,7 +224,7 @@ KLINE_INTERVALS        = list(dict.fromkeys(
 # Velas cerradas guardadas por símbolo e intervalo (2 = última y penúltima).
 KLINE_HISTORY          = int(os.getenv("KLINE_HISTORY", "2"))
 # float64 = precisión exacta (48 bytes/vela); float32 = mitad de RAM (28 bytes/vela).
-KLINE_DTYPE            = os.getenv("KLINE_DTYPE", "float64")
+KLINE_DTYPE            = os.getenv("KLINE_DTYPE", "float32")
 # false = sin vela cerrada reciente (primer minuto tras arrancar o reconexión)
 # NO se abre la entrada; true = se permite (comportamiento anterior).
 KLINE_ALLOW_NO_DATA    = os.getenv("KLINE_ALLOW_NO_DATA", "false").lower() == "true"
@@ -268,16 +270,32 @@ EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
 STATS_FILE    = os.getenv("STATS_FILE",    os.path.join(_HERE, "trade_stats.jsonl"))
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", os.path.join(_HERE, "bot_settings.json"))
 
+# ── Recuperación tras reinicio (state_store.py) ───────────────────────────────
+# Posiciones abiertas, cooldowns, trade_id, SL global e historial de cierres se
+# guardan en Upstash Redis (UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN)
+# y en una copia local. Sin esas variables solo queda la copia local, que en
+# Render free se pierde en cada reinicio.
+RECOVERY_FILE     = os.getenv("RECOVERY_FILE", os.path.join(tempfile.gettempdir(), "botshort_recovery.json"))
+STATE_KEY_PREFIX  = os.getenv("STATE_KEY_PREFIX", "botshort")
+STATE_TRADES_MAX  = int(os.getenv("STATE_TRADES_MAX", "5000"))
+STATE_BOOT_WAIT_S = float(os.getenv("STATE_BOOT_WAIT_S", "20"))   # espera inicial al estado antes de abrir los WS
+SHUTDOWN_DRAIN_S  = 5.0     # al apagar: espera a que terminen las órdenes en vuelo antes del guardado final
+
+# True si el SL global se cambió desde la web: solo entonces viaja en el estado
+# guardado (si no, manda DEFAULT_STOP_LOSS_USD del entorno).
+DEFAULT_SL_FROM_UI = False
+
 
 def _load_settings() -> None:
     """Restaura el SL global guardado desde la web (sobrescribe el valor de entorno)."""
-    global DEFAULT_STOP_LOSS_USD
+    global DEFAULT_STOP_LOSS_USD, DEFAULT_SL_FROM_UI
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         val = float(data.get("default_stop_loss_usd"))
         if val < 0:
             DEFAULT_STOP_LOSS_USD = val
+            DEFAULT_SL_FROM_UI = True
     except Exception:
         pass
 
@@ -585,6 +603,14 @@ class TradingBot:
         self._stats_lock = threading.Lock()
         self._load_trade_stats()
 
+        # ── Persistencia externa para recuperar el estado tras un reinicio ──
+        backend, self._store_desc = backend_from_env(self.log)
+        self.store = StateStore(
+            backend, RECOVERY_FILE, make_owner_id(),
+            build_doc=self._recovery_doc, log=self.log, on_fenced=self._on_fenced,
+            key_prefix=STATE_KEY_PREFIX, max_trades=STATE_TRADES_MAX,
+        )
+
     # ── Logging ───────────────────────────────────────────────────────────────
 
     def log(self, msg: str) -> None:
@@ -669,10 +695,24 @@ class TradingBot:
         self.log("Bot iniciado — modo " + (
             "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL"
         ))
+        # Recuperación: pide el control del estado en Upstash mientras carga lo demás
+        self.log(f"[estado] Persistencia: {self._store_desc}")
+        self.store.start()
+
         # Lista de perpetuos operables: caché en disco o UNA petición REST
         await self._init_all_symbols()
         self.exchange_symbols = len(self.client.exchange_filters)
         self._update_tradable()
+
+        # Las posiciones se restauran ANTES de abrir los WebSockets y el motor:
+        # así se suscriben desde el inicio y ningún tick abre un duplicado.
+        if await asyncio.to_thread(self.store.acquired.wait, STATE_BOOT_WAIT_S):
+            self._restore_from_store()
+        else:
+            # Otra instancia sigue siendo la dueña (deploy con solapamiento) o Upstash
+            # no responde: el mantenimiento aplicará el estado en cuanto llegue.
+            self.log("[estado] ⚠️ Aún no controlo el estado (otra instancia activa o Upstash no responde): "
+                     "sin entradas ni cierres hasta recuperarlo")
 
         if not _ALL_MARKET_ENABLED:
             self.log("⚠️ WS_ALL_MARKET=false: sin !ticker@arr/!markPrice@arr el bot NO puede "
@@ -1035,7 +1075,7 @@ class TradingBot:
 
     def _check_exits(self, symbol: str, price: float) -> None:
         """TP / SL. Pre-chequeo barato en el loop; el cierre real va a una tarea."""
-        if symbol in self._closing_symbols:
+        if symbol in self._closing_symbols or not self.store.can_act():
             return
         if time.time() < self._close_backoff.get(symbol, 0.0):
             return
@@ -1060,6 +1100,12 @@ class TradingBot:
         if symbol in self._entry_inflight or symbol in self._closing_symbols:
             return
         now = time.time()
+        if not self.store.can_open():
+            # Sin persistencia confirmada una posición nueva se perdería en un reinicio.
+            if now - self._log_throttle.get("entries_paused", 0.0) >= 60.0:
+                self._log_throttled("entries_paused", "Entradas en pausa: persistencia del estado no "
+                                    f"confirmada ({self.store.status()['mode']})", secs=60.0)
+            return
         if now < self._entry_backoff.get(symbol, 0.0):
             return
         with self.lock:
@@ -1093,6 +1139,7 @@ class TradingBot:
             newly = symbol not in self.price_blocked
             self.price_blocked.add(symbol)
         if newly:
+            self.persist_state(critical=False)
             self.log(f"BLOQUEADO permanente {symbol}: precio {price:.4f} > {MAX_PRICE_BLOCK} USD")
 
     async def _enter_levels(self, symbol: str, due: list) -> None:
@@ -1167,6 +1214,8 @@ class TradingBot:
         """Abre el tramo `level`. True si se abrió. El nivel se RESERVA antes de
         enviar la orden para que ningún tick lo duplique mientras está en vuelo."""
         key = (symbol, level)
+        if not self.store.can_open():
+            return False
         with self.lock:
             if self.symbol_cooldown.get(symbol, 0.0) > time.time():
                 return False
@@ -1227,6 +1276,10 @@ class TradingBot:
     async def _close_position(self, symbol: str, price: float, reason: str,
                               acquired: bool = False) -> bool:
         """Cierre único para TP / SL / MANUAL (antes había 3 copias del mismo código)."""
+        if not self.store.can_act():                  # standby: otra instancia es la dueña
+            if acquired:
+                self._end_close_guard(symbol)
+            return False
         if not acquired and not self._begin_close_guard(symbol):
             return False
         try:
@@ -1332,6 +1385,8 @@ class TradingBot:
                         **exc,
                     })
                     self.closed_trades = self.closed_trades[:500]
+                # Misma sección crítica que saca la posición: el guardado lleva las dos cosas juntas
+                self.store.append_trade(stat_rec)
 
             self._record_trade_stat(stat_rec)
             self.executor.notify_close(
@@ -1466,8 +1521,9 @@ class TradingBot:
     def set_default_stop_loss(self, sl_usd: float, override_manual: bool = False) -> dict:
         """Cambia el SL estándar (2+ tramos), lo guarda en disco y lo aplica ya a las
         posiciones abiertas. Los SL manuales se respetan salvo override_manual=True."""
-        global DEFAULT_STOP_LOSS_USD
+        global DEFAULT_STOP_LOSS_USD, DEFAULT_SL_FROM_UI
         DEFAULT_STOP_LOSS_USD = float(sl_usd)
+        DEFAULT_SL_FROM_UI = True
         updated: List[str] = []
         with self.lock:
             for sym, pos in self.positions.items():
@@ -1510,10 +1566,23 @@ class TradingBot:
         self._enqueue(symbol)
         return True
 
-    async def close_position_manual(self, symbol: str) -> bool:
-        """Cierre manual de una posición abierta desde la UI."""
+    async def close_position_manual(self, symbol: str, force: bool = False) -> bool:
+        """Cierre manual de una posición abierta desde la UI. force=True (cierre de
+        emergencia) cierra aunque no haya precio en vivo, registrándolo al precio medio
+        de entrada (PnL 0): así una posición sin cotización no queda atascada."""
         symbol = symbol.upper().strip()
         price = self._display_price(symbol)
+        if price <= 0 and force:
+            with self.lock:
+                pos = self.positions.get(symbol)
+                price = pos.avg_entry if pos is not None else 0.0
+            if price > 0:
+                self.log(f"⚠️ Cierre forzado de {symbol} sin precio en vivo: se registra al precio "
+                         f"medio de entrada {price:.6f} (PnL 0)")
+        if price <= 0:
+            # Recién arrancado (p. ej. tras recuperar el estado) aún no hay precio por WebSocket.
+            raise RuntimeError(f"Todavía no hay precio de {symbol}; reintenta en unos segundos "
+                               "(o usa el cierre forzado)")
         return await self._close_position(symbol, price, "MANUAL")
 
     # ── Mantenimiento (housekeeping; NO es la vía de detección) ───────────────
@@ -1555,11 +1624,15 @@ class TradingBot:
                     self._price_block_reset_at = now
                     with self.lock:
                         self.price_blocked.clear()
+                    self.persist_state(critical=False)
                     self.log("price_blocked reseteado (cada SYMBOL_REFRESH_HOURS)")
 
                 if now - last_persist >= STATE_PERSIST_SECS:
                     last_persist = now
-                    self.persist_state()
+                    self.persist_state(critical=False)    # MFE/MAE: a Upstash como mucho cada minuto
+
+                if self.store.restore_pending():
+                    self._restore_from_store(late=True)    # tomó el control después de arrancar
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1768,6 +1841,7 @@ class TradingBot:
                 "total_messages":  kl_stats.get("total_messages",  0),
                 "active_conns":    kl_stats.get("active_connections", 0),
             },
+            "persistence": self.store.status(),
             "ts": now,
         }
 
@@ -1834,10 +1908,198 @@ class TradingBot:
                         break
                     raise
 
+    # ── Recuperación tras reinicio ────────────────────────────────────────────
+
+    def _recovery_doc(self) -> Tuple[dict, List[dict]]:
+        """Documento que se guarda en Upstash: solo lo necesario para retomar.
+        Las posiciones cerradas no aparecen (desaparecen del documento al cerrar).
+        Devuelve también los cierres pendientes de envío, tomados bajo el mismo
+        lock: una posición cerrada nunca sale del documento sin su fila del historial."""
+        now = time.time()
+        with self.lock:
+            positions = {
+                sym: asdict(pos) for sym, pos in self.positions.items()
+                if pos.status == "OPEN" and pos.fills
+            }
+            cooldowns     = {s: ts for s, ts in self.symbol_cooldown.items() if ts > now}
+            price_blocked = sorted(self.price_blocked)
+            total_pnl     = self.total_realized_pnl
+            trades        = self.store.peek_trades()
+        with self._trade_id_lock:
+            seq = self._trade_id_seq
+        doc = {
+            "v":                     1,
+            "trade_id_seq":          seq,
+            "total_realized_pnl":    total_pnl,
+            "positions":             positions,
+            "cooldowns":             cooldowns,
+            "price_blocked":         price_blocked,
+            "price_block_reset_at":  self._price_block_reset_at,
+        }
+        if DEFAULT_SL_FROM_UI:
+            doc["default_stop_loss_usd"] = DEFAULT_STOP_LOSS_USD
+        return doc, trades
+
+    @staticmethod
+    def _position_from_dict(d: dict) -> Optional[BotPosition]:
+        fills = []
+        for f in d.get("fills") or []:
+            try:
+                fills.append(Fill(
+                    level=float(f["level"]), notional=float(f["notional"]),
+                    entry_price=float(f["entry_price"]), qty=float(f["qty"]),
+                    opened_at=float(f.get("opened_at") or time.time()),
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not fills or not d.get("symbol"):
+            return None
+        known = {f.name for f in fields(BotPosition)} - {"fills", "status"}
+        pos = BotPosition(fills=fills, **{k: d[k] for k in known if k in d})
+        pos.status = "OPEN"
+        return pos
+
+    def _restore_from_store(self, late: bool = False) -> bool:
+        """Aplica el estado leído al tomar el control y empieza a operar y guardar.
+        late=True: llegó con los WebSockets ya abiertos (corre en el loop del bot)."""
+        r = self.store.take_restore()
+        if r is None:
+            return False
+        doc, trades, source = r
+        self._apply_recovery(doc, trades, source)
+        if not self.store.enable_writes():
+            self.log("[estado] Perdí el control mientras aplicaba el estado; sigo esperando")
+            return False
+        if late:
+            for sym in self._open_position_symbols():
+                self._watch_add(sym)
+                self._enqueue(sym)
+        return True
+
+    def _apply_recovery(self, doc: Optional[dict], trades: List[dict], source: str) -> None:
+        """Restaura el estado guardado, reemplazando el de memoria. Llamar antes de
+        arrancar WebSockets y motor, o desde el loop del bot si llega más tarde."""
+        global DEFAULT_STOP_LOSS_USD, DEFAULT_SL_FROM_UI
+        now = time.time()
+        doc = doc or {}
+        try:
+            sl = float(doc.get("default_stop_loss_usd"))   # solo está si se cambió desde la web
+            if sl < 0:
+                DEFAULT_STOP_LOSS_USD = sl       # antes que las posiciones (lo usa refresh_auto_sl)
+                DEFAULT_SL_FROM_UI = True
+        except (TypeError, ValueError):
+            pass
+
+        positions: Dict[str, BotPosition] = {}
+        for sym, d in (doc.get("positions") or {}).items():
+            pos = self._position_from_dict(d) if isinstance(d, dict) else None
+            if pos is None:
+                self.log(f"[estado] posición {sym} ilegible en el documento; se descarta")
+                continue
+            positions[pos.symbol] = pos
+        cooldowns = {}
+        for sym, ts in (doc.get("cooldowns") or {}).items():
+            try:
+                if float(ts) > now:
+                    cooldowns[sym] = float(ts)
+            except (TypeError, ValueError):
+                continue
+
+        stats = self._merge_trades(trades)
+
+        with self.lock:
+            self.positions       = positions
+            self.symbol_cooldown = cooldowns
+            self.price_blocked   = set(doc.get("price_blocked") or [])
+            try:
+                self.total_realized_pnl = float(doc.get("total_realized_pnl") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            self.closed_trades = [self._closed_row(r, cooldowns) for r in reversed(stats[-500:])]
+        try:
+            reset_at = float(doc.get("price_block_reset_at") or 0.0)
+            if 0 < reset_at <= now:
+                self._price_block_reset_at = reset_at     # el reseteo de 12h no se reinicia con cada arranque
+        except (TypeError, ValueError):
+            pass
+
+        self._bump_trade_id_seq(int(doc.get("trade_id_seq") or 0),
+                                *[int(p.trade_id or 0) for p in positions.values()])
+
+        detail = ", ".join(
+            f"{p.symbol} (trade {p.trade_id}, {len(p.fills)} tramo(s), SL {p.sl_usd:.2f})"
+            for p in positions.values()
+        ) or "ninguna"
+        self.log(f"[estado] Recuperado desde {source}: posiciones abiertas: {detail} | "
+                 f"cooldowns: {len(cooldowns)} | historial: {len(stats)} cierres | "
+                 f"próximo trade_id: {self._trade_id_seq + 1}")
+
+    def _merge_trades(self, trades: List[dict]) -> List[dict]:
+        """Une el historial remoto con el local (sin duplicados) y devuelve una copia."""
+        with self._stats_lock:
+            seen = {(r.get("trade_id"), r.get("closed_at_ts")) for r in self.trade_stats}
+            for r in trades:
+                key = (r.get("trade_id"), r.get("closed_at_ts")) if isinstance(r, dict) else None
+                if key is not None and key not in seen:
+                    seen.add(key)
+                    self.trade_stats.append(r)
+            self.trade_stats.sort(key=lambda r: float(r.get("closed_at_ts") or 0))
+            stats = list(self.trade_stats)
+        self._bump_trade_id_seq(*[int(r.get("trade_id") or 0) for r in stats])
+        return stats
+
+    def _bump_trade_id_seq(self, *ids: int) -> None:
+        with self._trade_id_lock:
+            self._trade_id_seq = max([self._trade_id_seq, *ids])   # nunca repetir un trade_id
+
+    @staticmethod
+    def _closed_row(r: dict, cooldowns: Dict[str, float]) -> dict:
+        def fmt(ts: Any, pattern: str) -> str:
+            try:
+                return datetime.fromtimestamp(float(ts), timezone.utc).strftime(pattern)
+            except (TypeError, ValueError, OverflowError, OSError):
+                return ""
+        sym = r.get("symbol", "")
+        return {
+            "symbol":      sym,
+            "pnl":         r.get("pnl", 0.0),
+            "target":      r.get("target", 0.0),
+            "qty":         r.get("qty", 0.0),
+            "avg_entry":   r.get("avg_entry", 0.0),
+            "close_price": r.get("close_price", 0.0),
+            "notional":    r.get("notional", 0.0),
+            "closed_at":   fmt(r.get("closed_at_ts"), "%Y-%m-%d %H:%M:%S UTC"),
+            "unblock_at":  fmt(cooldowns[sym], "%Y-%m-%d %H:%M UTC") if sym in cooldowns else "",
+            "reason":      r.get("reason", ""),
+            "mfe_usd":     r.get("mfe_usd", 0.0),
+            "mae_usd":     r.get("mae_usd", 0.0),
+            "mfe_pct":     r.get("mfe_pct", 0.0),
+            "mae_pct":     r.get("mae_pct", 0.0),
+            "duration_s":  r.get("duration_s", 0.0),
+        }
+
+    def _on_fenced(self) -> None:
+        self.last_error = "Otra instancia tomó el control del estado: esta queda en standby"
+
+    def shutdown(self) -> None:
+        """Apagado ordenado (gunicorn ejecuta atexit al recibir SIGTERM de Render):
+        deja de operar, espera las órdenes en vuelo, guarda por última vez y libera
+        el control para que la instancia nueva lo tome sin esperar a que caduque."""
+        self.store.begin_stop()
+        deadline = time.time() + SHUTDOWN_DRAIN_S
+        while time.time() < deadline and (self._entry_reserved or self._closing_symbols):
+            time.sleep(0.1)
+        if self.store.close():
+            print("[estado] guardado final enviado"
+                  + (" y control liberado" if self.store.remote else " (disco local)"), flush=True)
+
     # ── Persistencia ──────────────────────────────────────────────────────────
 
-    def persist_state(self) -> None:
-        """Solicita persistencia asíncrona del estado sin bloquear el loop."""
+    def persist_state(self, critical: bool = True) -> None:
+        """Solicita persistencia asíncrona del estado sin bloquear el loop.
+        critical=True (abrir/cerrar/SL) se guarda en Upstash al instante;
+        False (MFE/MAE, bloqueos) va con el siguiente latido (STATE_HEARTBEAT_S)."""
+        self.store.mark_dirty(critical)
         if self._persist_event is None:
             snap = self._build_snapshot()
             self._write_state_file(snap)
@@ -1874,6 +2136,7 @@ class TradingBot:
 
 bot = TradingBot()
 bot.start()
+atexit.register(bot.shutdown)
 
 app = Flask(__name__)
 
@@ -2223,6 +2486,7 @@ HTML = r"""<!doctype html>
       <div class="chip">kline pares: <b id="klPairs">—</b></div>
       <div class="chip">kline msgs: <b id="klMsgs">—</b></div>
       <div class="chip">kline conns: <b id="klConns">—</b></div>
+      <div class="chip">estado guardado: <b id="persistMode">—</b></div>
       <div class="chip">polls estado: <b id="pollCount">0</b></div>
       <div class="chip">polls precios: <b id="livePollCount">0</b></div>
     </div>
@@ -2348,6 +2612,9 @@ function render(d) {
   q('klPairs').textContent = n(kw.pairs_with_data);
   q('klMsgs').textContent = n(kw.total_messages);
   q('klConns').textContent = n(kw.active_conns);
+  const ps = d.persistence || {};
+  q('persistMode').textContent = ps.mode ? `${ps.backend} · ${ps.mode}` : '—';
+  q('persistMode').className = ps.mode === 'ok' || ps.mode === 'local' ? 'teal' : 'violet';
   q('pollCount').textContent = pollCount;
   q('livePollCount').textContent = livePollCount;
 
@@ -2737,12 +3004,26 @@ def api_live():
     return resp
 
 
+def _not_owner_response():
+    """409 si esta instancia no controla el estado (standby, esperando o apagándose):
+    un cambio aquí no se guardaría ni se ejecutaría."""
+    if bot.store.can_act():
+        return None
+    mode = bot.store.status()["mode"]
+    return jsonify({"ok": False, "error": f"Esta instancia no controla el estado ({mode}); "
+                                         "otra instancia opera o se está recuperando. "
+                                         "Reintenta en unos segundos."}), 409
+
+
 @app.post("/api/close/<symbol>")
 def api_close(symbol: str):
     """Cierre manual de una posición abierta."""
     symbol = symbol.upper().strip()
     if not bot.loop or not bot.loop.is_running():
         return jsonify({"ok": False, "error": "Bot loop no está activo"}), 503
+    busy = _not_owner_response()
+    if busy:
+        return busy
     future = asyncio.run_coroutine_threadsafe(
         bot.close_position_manual(symbol), bot.loop
     )
@@ -2774,6 +3055,9 @@ def api_set_sl(symbol: str):
         return jsonify({"ok": False, "error": "sl_usd inválido"}), 400
     if sl_usd >= 0:
         return jsonify({"ok": False, "error": "sl_usd debe ser un valor negativo (pérdida)"}), 400
+    busy = _not_owner_response()
+    if busy:
+        return busy
     ok = bot.set_stop_loss(symbol, sl_usd)
     if ok:
         return jsonify({"ok": True, "symbol": symbol, "sl_usd": sl_usd})
@@ -2788,13 +3072,16 @@ def api_force_close(symbol: str):
     symbol = symbol.upper().strip()
     if not bot.loop or not bot.loop.is_running():
         return jsonify({"ok": False, "error": "Bot loop no está activo"}), 503
+    busy = _not_owner_response()
+    if busy:
+        return busy
 
     # 1) liberar el guard sin esperar a que la tarea vieja termine
     with bot.lock:
         bot._closing_symbols.discard(symbol)
 
     future = asyncio.run_coroutine_threadsafe(
-        bot.close_position_manual(symbol), bot.loop
+        bot.close_position_manual(symbol, force=True), bot.loop
     )
     try:
         ok = future.result(timeout=20)
@@ -2873,6 +3160,9 @@ def api_set_default_sl():
         return jsonify({"ok": False, "error": "sl_usd debe ser un valor negativo (pérdida)"}), 400
     if sl_usd < -100000:
         return jsonify({"ok": False, "error": "sl_usd fuera de rango"}), 400
+    busy = _not_owner_response()
+    if busy:
+        return busy
     override = bool(data.get("override_manual", False))
     result = bot.set_default_stop_loss(sl_usd, override_manual=override)
     return jsonify({"ok": True, **result})
@@ -2894,7 +3184,17 @@ def health():
         "subscribed_count":  snap["subscribed_count"],
         "last_error":        snap["last_error"],
         "cooldown_count":    snap["cooldown_count"],
+        "persistence":       bot.store.status(),
     })
+
+
+@app.get("/api/recovery")
+def api_recovery():
+    """Estado de la persistencia y último documento guardado (lo que se recuperaría)."""
+    doc = bot.store.last_doc or bot.store.read_local()
+    resp = jsonify({"status": bot.store.status(), "document": doc})
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 
 if __name__ == "__main__":
