@@ -26,15 +26,11 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from WS import SymbolWebSocketPriceCache, _ALL_MARKET_ENABLED  # noqa: E402
-from KlineWebSocketCache_v4 import KlineWebSocketCache      # noqa: E402
+from kline_ws import KlineWebSocketStream                     # noqa: E402
 
 # ── ExecutorBridge (señales al Executor externo) ─────────────────────────────
-import urllib.error
-import urllib.request
-from dataclasses import dataclass as _dataclass_eb
 
-
-@_dataclass_eb
+@dataclass
 class _ExecutorSignalConfig:
     executor_url:   str = ""
     signal_secret:   str = "clave-secreta-aleatoria"
@@ -183,12 +179,17 @@ PAPER_MODE    = os.getenv("PAPER_MODE",   "true").lower() == "true"
 LIVE_TRADING  = os.getenv("LIVE_TRADING", "false").lower() == "true"
 API_KEY       = os.getenv("BINANCE_API_KEY",    "")
 API_SECRET    = os.getenv("BINANCE_API_SECRET", "")
-LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
+# Proxy HTTP opcional SOLO para la única consulta REST del arranque
+# (exchangeInfo). Ej.: http://usuario:clave@host:80 — configúralo como secreto,
+# nunca en el código. Si falla, se reintenta una vez por la IP directa.
+REST_PROXY_URL = os.getenv("REST_PROXY_URL", "http://fixie:6U5qGtczYcZJRHN@ventoux.usefixie.com:80").strip()
 STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
 # ── Gestión de símbolos ───────────────────────────────────────────────────────
 INITIAL_SYMBOLS = [ s.strip() for s in os.getenv("INITIAL_SYMBOLS", "").split(",") if s.strip() ]
-# Lista completa de símbolos (solo para saber cuáles son perpetuos operables):
-# REST inicial + caché en disco + refresh cada 12 h
+# Lista de perpetuos operables + filtros (stepSize/minQty/minNotional).
+# Se obtiene con UNA consulta REST (exchangeInfo) al arrancar y se guarda en
+# disco; si el caché tiene menos de SYMBOL_REFRESH_HOURS, el arranque no hace
+# ninguna petición REST. Durante la ejecución NO se vuelve a consultar.
 SYMBOLS_CACHE_FILE   = os.getenv(
     "SYMBOLS_CACHE_FILE",
     os.path.join(tempfile.gettempdir(), "futures_symbols_cache.json")
@@ -213,8 +214,18 @@ PRICE_MAX_AGE_S        = float(os.getenv("PRICE_MAX_AGE_S",        "5"))    # un
 # true = el % de cambio se recalcula en cada tick con (precio / open24h - 1),
 # en vez de esperar al ticker 24h (que llega cada ~1 s).
 USE_LIVE_CHANGE        = os.getenv("USE_LIVE_CHANGE", "true").lower() == "true"
-KLINE_RESTART_MIN_SECS = float(os.getenv("KLINE_RESTART_MIN_SECS", "60"))   # mín. entre reinicios del kline cache
-KLINE_CHECK_TTL_S      = float(os.getenv("KLINE_CHECK_TTL_S",      "1.0"))  # cachea la condición kline por símbolo
+# Velas SOLO por WebSocket (kline_ws.py) para TODOS los símbolos, sin REST:
+# una conexión por intervalo. "1m" siempre se incluye (confirmación de entrada).
+KLINE_INTERVALS        = list(dict.fromkeys(
+    ["1m"] + [x.strip() for x in os.getenv("KLINE_INTERVALS", "1m").split(",") if x.strip()]
+))
+# Velas cerradas guardadas por símbolo e intervalo (2 = última y penúltima).
+KLINE_HISTORY          = int(os.getenv("KLINE_HISTORY", "2"))
+# float64 = precisión exacta (48 bytes/vela); float32 = mitad de RAM (28 bytes/vela).
+KLINE_DTYPE            = os.getenv("KLINE_DTYPE", "float64")
+# false = sin vela cerrada reciente (primer minuto tras arrancar o reconexión)
+# NO se abre la entrada; true = se permite (comportamiento anterior).
+KLINE_ALLOW_NO_DATA    = os.getenv("KLINE_ALLOW_NO_DATA", "false").lower() == "true"
 ENTRY_ERROR_BACKOFF_S  = float(os.getenv("ENTRY_ERROR_BACKOFF_S",  "5"))    # pausa tras fallo al abrir
 CLOSE_ERROR_BACKOFF_S  = float(os.getenv("CLOSE_ERROR_BACKOFF_S",  "3"))    # pausa tras fallo al cerrar
 STATE_PERSIST_SECS     = float(os.getenv("STATE_PERSIST_SECS",     "10"))   # guardado periódico del estado
@@ -385,20 +396,18 @@ class BotPosition:
 class BinanceFuturesClient:
     def __init__(self) -> None:
         self.exchange_filters: Dict[str, Dict[str, float]] = {}
-
-    async def start(self) -> None:
-        await self.load_exchange_info()
+        self.route_used = ""
 
     async def request(self, method: str, path: str,
                       params: Optional[dict] = None, signed: bool = False,
-                      timeout: int = 15) -> Any:
+                      timeout: int = 15, proxy: str = "") -> Any:
         return await asyncio.to_thread(
-            self._sync_request, BASE_URL, method, path, params, signed, timeout
+            self._sync_request, BASE_URL, method, path, params, signed, timeout, proxy
         )
 
     def _sync_request(self, base_url: str, method: str, path: str,
                       params: Optional[dict] = None, signed: bool = False,
-                      timeout: int = 15) -> Any:
+                      timeout: int = 15, proxy: str = "") -> Any:
         params  = dict(params or {})
         headers = {"User-Agent": "BOTSHORT/2.0"}
         if signed:
@@ -416,15 +425,32 @@ class BinanceFuturesClient:
         query = urlencode(params, doseq=True)
         url   = f"{base_url}{path}" + (f"?{query}" if query else "")
         req   = urllib.request.Request(url, headers=headers, method=method.upper())
+        handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
+        opener   = urllib.request.build_opener(*handlers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with opener.open(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Binance HTTP {exc.code}: {body[:300]}") from exc
 
-    async def load_exchange_info(self) -> None:
-        data    = await self.request("GET", "/fapi/v1/exchangeInfo")
+    async def fetch_exchange_info(self) -> Dict[str, Dict[str, float]]:
+        """ÚNICA consulta REST del bot (solo al arrancar). Va por REST_PROXY_URL si
+        está configurado y, si el proxy falla, se intenta una vez por la IP directa.
+        Rellena y devuelve exchange_filters (símbolo → filtros)."""
+        routes = [("proxy", REST_PROXY_URL), ("IP directa", "")] if REST_PROXY_URL else [("IP directa", "")]
+        last_exc: Optional[Exception] = None
+        data = None
+        for label, proxy in routes:
+            try:
+                data = await self.request("GET", "/fapi/v1/exchangeInfo", proxy=proxy)
+                self.route_used = label
+                break
+            except Exception as exc:
+                last_exc = exc
+                print(f"[REST] exchangeInfo por {label} falló: {exc}", flush=True)
+        if data is None:
+            raise RuntimeError(f"exchangeInfo falló: {last_exc}")
         filters: Dict[str, Dict[str, float]] = {}
         for sym in data.get("symbols", []):
             if sym.get("quoteAsset")    != QUOTE_ASSET:  continue
@@ -439,6 +465,7 @@ class BinanceFuturesClient:
                     row["minNotional"] = float(f.get("notional", row["minNotional"]))
             filters[sym["symbol"]] = row
         self.exchange_filters = filters
+        return filters
 
     def normalize_qty(self, symbol: str, qty: float) -> float:
         info = self.exchange_filters.get(symbol, {"stepSize": 0.001, "minQty": 0.0})
@@ -448,13 +475,6 @@ class BinanceFuturesClient:
         norm = round(norm, decs)
         return norm if norm >= info.get("minQty", 0.0) else 0.0
 
-    async def set_leverage(self, symbol: str) -> None:
-        if LEVERAGE > 0 and LIVE_TRADING and not PAPER_MODE:
-            await self.request(
-                "POST", "/fapi/v1/leverage",
-                {"symbol": symbol, "leverage": LEVERAGE}, signed=True
-            )
-
     async def market_short(self, symbol: str, notional: float, price: float) -> float:
         min_notional = self.exchange_filters.get(symbol, {}).get("minNotional", 5.0)
         effective    = max(notional, min_notional)
@@ -463,7 +483,7 @@ class BinanceFuturesClient:
             raise RuntimeError(f"Qty inválida {symbol}: notional={effective} price={price}")
         if PAPER_MODE or not LIVE_TRADING:
             return qty
-        await self.set_leverage(symbol)
+        # Sin consulta de leverage: se usa el apalancamiento ya configurado en la cuenta.
         await self.request("POST", "/fapi/v1/order",
             {"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": qty},
             signed=True)
@@ -504,14 +524,11 @@ class TradingBot:
         # ── Lista de símbolos operables (REST + caché en disco, refresh c/12h) ──
         self.all_symbols:              List[str] = []
         self._tradable:                frozenset = frozenset()
-        self.last_symbols_refresh_at:  float     = 0.0
+        self._price_block_reset_at:    float     = time.time()
 
         # ── WS caches ─────────────────────────────────────────────────────
         self.price_cache:   Optional[SymbolWebSocketPriceCache] = None
-        self.kline_cache:   Optional[KlineWebSocketCache]       = None
-        self.kline_symbols: frozenset = frozenset()
-        self._kline_last_restart = 0.0
-        self._kline_ok_cache: Dict[str, tuple] = {}
+        self.kline_cache:   Optional[KlineWebSocketStream]      = None
 
         # ── Radar (símbolos con bookTicker suscrito). Copy-on-write: SOLO el
         #    loop del bot lo reasigna; el resto (hilo WS, Flask) solo lee. ──
@@ -519,7 +536,6 @@ class TradingBot:
 
         # ── Motor por eventos ─────────────────────────────────────────────
         self._tick_event:   Optional[asyncio.Event] = None   # se crea en el loop del bot
-        self._kline_dirty:  Optional[asyncio.Event] = None
         self._pending:      Dict[str, float] = {}            # símbolo → instante del primer tick pendiente
         self._pending_lock  = threading.Lock()
         self._wake_scheduled = False
@@ -600,7 +616,6 @@ class TradingBot:
         asyncio.set_event_loop(self.loop)
         self._persist_event = asyncio.Event()
         self._tick_event    = asyncio.Event()
-        self._kline_dirty   = asyncio.Event()
         try:
             self.loop.run_until_complete(self._main())
         except Exception as exc:
@@ -654,16 +669,9 @@ class TradingBot:
         self.log("Bot iniciado — modo " + (
             "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL"
         ))
-        try:
-            await self.client.start()
-            self.exchange_symbols = len(self.client.exchange_filters)
-            self.log(f"ExchangeInfo: {self.exchange_symbols} contratos USDT-M perpetuos")
-        except Exception as exc:
-            self.last_startup_err = str(exc)
-            self.log(f"ExchangeInfo falló ({exc}). Continúo con filtros mínimos.")
-
-        # Lista de perpetuos operables (caché en disco o REST)
+        # Lista de perpetuos operables: caché en disco o UNA petición REST
         await self._init_all_symbols()
+        self.exchange_symbols = len(self.client.exchange_filters)
         self._update_tradable()
 
         if not _ALL_MARKET_ENABLED:
@@ -672,12 +680,12 @@ class TradingBot:
 
         # UNA sola conexión WS permanente; el callback despierta al motor en cada tick
         self._start_price_cache()
+        # Velas 1m de TODOS los símbolos por WebSocket (sin REST, sin reinicios)
+        self._start_kline_cache(self.all_symbols)
 
         tasks = [
             asyncio.create_task(self._supervised(self._engine_loop,             "_engine_loop")),
             asyncio.create_task(self._supervised(self._maintenance_loop,        "_maintenance_loop")),
-            asyncio.create_task(self._supervised(self._kline_sync_loop,         "_kline_sync_loop")),
-            asyncio.create_task(self._supervised(self._all_symbols_refresh_loop, "_all_symbols_refresh_loop")),
             asyncio.create_task(self._supervised(self._persist_state_loop,      "_persist_state_loop")),
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -724,24 +732,16 @@ class TradingBot:
         )
 
     def _start_kline_cache(self, symbols: List[str]) -> None:
+        """Arranca UNA vez el stream de velas (una conexión por intervalo) para
+        todos los símbolos. Los que entren después al radar se añaden con
+        ensure_symbols()."""
         self._stop_kline_cache()
-        if not symbols:
-            return
-        pairs = {sym: ["1m"] for sym in symbols}
-        self.kline_cache = KlineWebSocketCache(
-            pairs                           = pairs,
-            max_candles                     = 1,
-            include_open_candle             = True,
-            backfill_on_start               = False,
-            streams_per_connection          = 30,
-            rest_concurrency                = 5,
-            rest_retries                    = 3,
-            backfill_batch_size             = 3,
-            backfill_batch_delay            = 0.25,
-            safety_refresh_interval_seconds = 1500,
+        self.kline_cache = KlineWebSocketStream(
+            symbols, intervals=KLINE_INTERVALS, history=KLINE_HISTORY, dtype=KLINE_DTYPE,
         )
         self.kline_cache.start()
-        self.log(f"KlineCache iniciado con {len(symbols)} símbolos (1m)")
+        self.log(f"Velas por WebSocket ({', '.join(KLINE_INTERVALS)}): {len(symbols)} símbolos, "
+                 f"{KLINE_HISTORY} velas cerradas por símbolo, {KLINE_DTYPE} (sin REST)")
 
     # ── Símbolos operables (caché en disco + REST) ────────────────────────────
 
@@ -755,160 +755,65 @@ class TradingBot:
         # Sin lista (REST caído): se aceptan perpetuos USDT y se descartan trimestrales (BTCUSDT_250627)
         return symbol.endswith(QUOTE_ASSET) and "_" not in symbol
 
-    def _load_symbols_from_cache(self) -> List[str]:
-        """Lee la lista de símbolos desde el archivo de caché en disco."""
+    def _load_symbols_cache(self) -> Optional[dict]:
+        """Lee {symbols, filters, saved_at} del caché en disco (None si no hay)."""
         try:
-            if not os.path.exists(SYMBOLS_CACHE_FILE):
-                return []
             with open(SYMBOLS_CACHE_FILE, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            symbols   = data.get("symbols", [])
-            saved_at  = data.get("saved_at", 0)
-            age_hours = (time.time() - saved_at) / 3600
-            if symbols:
-                self.log(
-                    f"Caché de símbolos cargado: {len(symbols)} símbolos "
-                    f"(guardado hace {age_hours:.1f} h)"
-                )
-            return symbols if isinstance(symbols, list) else []
+            if isinstance(data.get("symbols"), list) and data["symbols"]:
+                return data
+        except FileNotFoundError:
+            pass
         except Exception as exc:
             self.log(f"No pude leer caché de símbolos: {exc}")
-            return []
+        return None
 
-    def _save_symbols_to_cache(self, symbols: List[str]) -> None:
-        """Guarda la lista de símbolos en disco para recuperación ante bloqueos."""
+    def _save_symbols_cache(self, symbols: List[str], filters: Dict[str, Dict[str, float]]) -> None:
         tmp = f"{SYMBOLS_CACHE_FILE}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"symbols": symbols, "saved_at": time.time()}, fh)
+                json.dump({"symbols": symbols, "filters": filters, "saved_at": time.time()}, fh)
             os.replace(tmp, SYMBOLS_CACHE_FILE)
-            self.log(f"Caché de símbolos guardado: {len(symbols)} símbolos → {SYMBOLS_CACHE_FILE}")
         except Exception as exc:
             self.log(f"No pude guardar caché de símbolos: {exc}")
 
-    async def _refresh_all_symbols(self) -> bool:
-        """
-        Obtiene todos los símbolos USDT-M perpetuos vía REST (exchangeInfo).
-        Guarda el resultado en SYMBOLS_CACHE_FILE como respaldo.
-        Devuelve True si tuvo éxito.
-        """
-        try:
-            self.log("REST: obteniendo lista completa de símbolos de futuros USDT-M...")
-            data    = await self.client.request("GET", "/fapi/v1/exchangeInfo")
-            filters = self.client.exchange_filters
-
-            symbols: List[str] = []
-            for sym_info in data.get("symbols", []):
-                if sym_info.get("quoteAsset")   != QUOTE_ASSET:  continue
-                if sym_info.get("contractType") != "PERPETUAL":  continue
-                if sym_info.get("status")       != "TRADING":    continue
-                s = sym_info["symbol"]
-                # Si exchange_filters ya está cargado, usarlo como filtro extra
-                if filters and s not in filters:
-                    continue
-                symbols.append(s)
-
-            if not symbols:
-                self.log("REST: respuesta vacía al obtener símbolos")
-                return False
-
-            self.all_symbols             = symbols
-            self._update_tradable()
-            self.last_symbols_refresh_at = time.time()
-            self._save_symbols_to_cache(symbols)
-            self.log(f"REST: {len(symbols)} símbolos cargados y guardados en caché")
-
-            if symbols:
-               with self.lock:
-                   self.price_blocked.clear()   # ← agregar esto al refrescar
-               self.log("price_blocked reseteado con el refresh de símbolos")
-             
-            return True
-
-        except RuntimeError as exc:
-            msg = str(exc)
-            if "418" in msg:
-                self.log(
-                    f"REST 418 (IP rate-limit Binance) al obtener símbolos — "
-                    f"usando caché si está disponible"
-                )
-                self.last_error = "HTTP 418 – rate-limit Binance REST al cargar símbolos"
-            else:
-                self.last_error = msg
-                self.log(f"REST _refresh_all_symbols falló: {msg}")
-            return False
-        except Exception as exc:
-            self.last_error = str(exc)
-            self.log(f"REST _refresh_all_symbols error: {exc}")
-            return False
-
     async def _init_all_symbols(self) -> None:
-        """
-        Carga inicial de símbolos:
-          1. Intenta leer desde caché en disco (rápido, sin REST).
-          2. Si el caché está vacío o falla, hace REST a exchangeInfo.
-          3. Si el REST también falla, usa exchange_filters como último recurso.
-        """
-        # Intento 1: caché en disco
-        cached = self._load_symbols_from_cache()
+        """Lista de perpetuos y filtros, con como mucho UNA petición REST:
+          1. Caché en disco con menos de SYMBOL_REFRESH_HOURS → 0 peticiones.
+          2. exchangeInfo (proxy si hay REST_PROXY_URL, si no IP directa).
+          3. Si falla: caché viejo, y como último recurso INITIAL_SYMBOLS.
+        Después de esto el bot no vuelve a usar REST para datos de mercado."""
+        cached = self._load_symbols_cache()
+        age_h  = (time.time() - float(cached.get("saved_at", 0))) / 3600 if cached else None
+        if cached and cached.get("filters") and age_h is not None and age_h < SYMBOL_REFRESH_HOURS:
+            self.all_symbols = list(cached["symbols"])
+            self.client.exchange_filters = dict(cached["filters"])
+            self.log(f"Símbolos desde caché en disco: {len(self.all_symbols)} "
+                     f"(hace {age_h:.1f} h) — sin peticiones REST")
+            return
+
+        try:
+            filters = await self.client.fetch_exchange_info()
+            self.all_symbols = sorted(filters)
+            self._save_symbols_cache(self.all_symbols, filters)
+            self.log(f"REST exchangeInfo ({self.client.route_used}): "
+                     f"{len(self.all_symbols)} perpetuos {QUOTE_ASSET} — única petición REST de datos")
+            return
+        except Exception as exc:
+            self.last_startup_err = str(exc)
+            self.last_error = str(exc)
+            self.log(f"exchangeInfo falló ({exc}).")
+
         if cached:
-            self.all_symbols             = cached
-            self.last_symbols_refresh_at = time.time()  # no forzar refresh inmediato
-            # Lanzar refresh en background para actualizar si el caché es viejo
-            asyncio.ensure_future(self._maybe_refresh_symbols_cache())
-            return
-
-        # Intento 2: REST
-        success = await self._refresh_all_symbols()
-        if success:
-            return
-
-        # Intento 3: exchange_filters (cargados al inicio desde exchangeInfo)
-        if self.client.exchange_filters:
-            self.all_symbols = list(self.client.exchange_filters.keys())
-            self.log(
-                f"Usando exchange_filters como fallback: {len(self.all_symbols)} símbolos"
-            )
-            
-            return
-        
-        # Intento 4: lista inicial fija
-        if INITIAL_SYMBOLS:
+            self.all_symbols = list(cached["symbols"])
+            self.client.exchange_filters = dict(cached.get("filters") or {})
+            self.log(f"Usando caché viejo de símbolos: {len(self.all_symbols)} (hace {age_h:.1f} h)")
+        elif INITIAL_SYMBOLS:
             self.all_symbols = INITIAL_SYMBOLS.copy()
-            self.last_symbols_refresh_at = time.time()
-            self.log(
-                f"Usando lista inicial fija: {len(self.all_symbols)} símbolos"
-            )
-            return
-        
+            self.log(f"Usando INITIAL_SYMBOLS: {len(self.all_symbols)} símbolos (sin filtros de lote)")
         else:
-            self.log(
-                "ADVERTENCIA: No hay símbolos disponibles. "
-                "El bot esperará hasta que se obtenga la lista."
-            )
-
-            self.all_symbols = INITIAL_SYMBOLS.copy()
-            self.last_symbols_refresh_at = time.time()
-            self.log(
-                f"Usando lista inicial fija: {len(self.all_symbols)} símbolos"
-            )
-
-    async def _maybe_refresh_symbols_cache(self) -> None:
-        """Refresca el caché si tiene más de SYMBOL_REFRESH_HOURS horas."""
-        age = time.time() - self.last_symbols_refresh_at
-        if age > SYMBOL_REFRESH_HOURS * 3600:
-            await self._refresh_all_symbols()
-
-    async def _all_symbols_refresh_loop(self) -> None:
-        """Refresca la lista completa de símbolos cada SYMBOL_REFRESH_HOURS."""
-        while self.running:
-            await asyncio.sleep(SYMBOL_REFRESH_HOURS * 3600)
-            if not self.running:
-                break
-            self.log(
-                f"Refresh de símbolos programado (cada {SYMBOL_REFRESH_HOURS} h)..."
-            )
-            await self._refresh_all_symbols()
+            self.log("ADVERTENCIA: sin lista de símbolos; se aceptan perpetuos "
+                     f"{QUOTE_ASSET} vistos por WebSocket.")
 
     # ── Motor por eventos ─────────────────────────────────────────────────────
     #
@@ -1057,8 +962,9 @@ class TradingBot:
             except Exception as exc:
                 self.last_error = str(exc)
                 self._log_throttled("watch_add", f"No pude suscribir {symbol}: {exc}")
-        if self._kline_dirty is not None:
-            self._kline_dirty.set()
+        kc = self.kline_cache
+        if kc is not None:
+            kc.ensure_symbols([symbol])         # no-op si ya estaba (normalmente sí)
         self.log(f"RADAR + {symbol} ({len(self.watch)} vigilados)")
 
     def _prune_watch(self) -> None:
@@ -1086,8 +992,6 @@ class TradingBot:
             pc.update_symbols(sorted(keep | pos_syms))
         except Exception as exc:
             self.last_error = str(exc)
-        if self._kline_dirty is not None:
-            self._kline_dirty.set()
         self.log(f"RADAR - {len(dropped)} fuera ({', '.join(sorted(dropped)[:6])}"
                  f"{'…' if len(dropped) > 6 else ''}) → {len(self.watch)} vigilados")
 
@@ -1152,15 +1056,6 @@ class TradingBot:
             return
         self._spawn(self._close_position(symbol, price, reason, acquired=True))
 
-    def _kline_ok_cached(self, symbol: str) -> bool:
-        now = time.time()
-        c = self._kline_ok_cache.get(symbol)
-        if c and now - c[0] < KLINE_CHECK_TTL_S:
-            return c[1]
-        ok = self._kline_entry_ok(symbol)
-        self._kline_ok_cache[symbol] = (now, ok)
-        return ok
-
     def _check_entries(self, symbol: str, price: float, change: float) -> None:
         if symbol in self._entry_inflight or symbol in self._closing_symbols:
             return
@@ -1187,7 +1082,7 @@ class TradingBot:
         if price > MAX_PRICE_BLOCK:
             self._block_by_price(symbol, price)
             return
-        if not self._kline_ok_cached(symbol):
+        if not self._kline_entry_ok(symbol):
             return
 
         self._entry_inflight.add(symbol)
@@ -1225,17 +1120,14 @@ class TradingBot:
     # ── Condición kline ───────────────────────────────────────────────────────
 
     def _kline_entry_ok(self, symbol: str) -> bool:
-        """True si la última vela 1m cerrada es alcista (o sin datos)."""
-        if not self.kline_cache:
-            return True
-        try:
-            df = self.kline_cache.get_dataframe(symbol, "1m", only_closed=True)
-            if df.empty or len(df) < 2:
-                return True
-            last = df.iloc[-1]
-            return float(last["close"]) >= float(last["open"])
-        except Exception:
-            return True
+        """True si la última vela 1m CERRADA (la del minuto anterior) es alcista.
+        Sin esa vela (recién arrancado, o se perdió un cierre en una reconexión)
+        decide KLINE_ALLOW_NO_DATA."""
+        kc = self.kline_cache
+        last = kc.last_closed(symbol, "1m") if kc is not None else None
+        if last is None:
+            return KLINE_ALLOW_NO_DATA
+        return last.bullish
 
     # ── Cooldown helpers ──────────────────────────────────────────────────────
 
@@ -1655,9 +1547,15 @@ class TradingBot:
                     self._prune_watch()
                     with self.lock:
                         self.symbol_cooldown = {s: ts for s, ts in self.symbol_cooldown.items() if ts > now}
-                    self._kline_ok_cache.clear()
                     self._entry_backoff = {s: ts for s, ts in self._entry_backoff.items() if ts > now}
                     self._close_backoff = {s: ts for s, ts in self._close_backoff.items() if ts > now}
+
+                if now - self._price_block_reset_at >= SYMBOL_REFRESH_HOURS * 3600:
+                    # Antes ocurría junto con el refresh REST de símbolos (ya eliminado)
+                    self._price_block_reset_at = now
+                    with self.lock:
+                        self.price_blocked.clear()
+                    self.log("price_blocked reseteado (cada SYMBOL_REFRESH_HOURS)")
 
                 if now - last_persist >= STATE_PERSIST_SECS:
                     last_persist = now
@@ -1667,24 +1565,6 @@ class TradingBot:
             except Exception as exc:
                 self.last_error = str(exc)
                 self._log_throttled("maint_err", f"Error en mantenimiento: {exc!r}")
-
-    async def _kline_sync_loop(self) -> None:
-        """Mantiene el KlineCache alineado con el radar. Guiado por evento (se
-        despierta cuando cambia el radar) y con un mínimo entre reinicios para
-        no vaciar el caché de velas continuamente."""
-        while self.running:
-            await self._kline_dirty.wait()
-            self._kline_dirty.clear()
-            wait = KLINE_RESTART_MIN_SECS - (time.time() - self._kline_last_restart)
-            if wait > 0:
-                await asyncio.sleep(wait)          # agrupa cambios del radar en un solo reinicio
-                self._kline_dirty.clear()
-            wanted = self.watch
-            if wanted == self.kline_symbols:
-                continue
-            self._kline_last_restart = time.time()
-            self.kline_symbols = wanted
-            await asyncio.to_thread(self._start_kline_cache, sorted(wanted))
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
